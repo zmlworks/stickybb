@@ -20,9 +20,12 @@
 - 未保存マーク: 変更があるとタイトルの先頭に「● 」
 - タイトル設定: 本文の 1 文字目が `#` の行（例 `#買い物メモ`）は、閉じる・Ctrl+S・シャットダウン時にウィンドウタイトルになります（本文からは削除、INI に保存）
 - **表示倍率（v1.1.0）**: ウィンドウごとに拡大 / 縮小。表示だけの倍率（EM_SETZOOM）なので、文字の色・書式や保存される RTF は変わりません
-- **最前面に表示（v1.1.0）**: タイトルバーのピンをクリックすると、そのウィンドウを常に手前に表示（オン = 色付きのまっすぐなピン、オフ = 灰色の傾いたピン）
+- **最前面に表示（v1.1.0）**: タイトルバーのピンをクリックすると、そのウィンドウを常に手前に表示（オン = まっすぐな塗りつぶしのピン＋背景、オフ = 傾いたピンの輪郭）
 
   ![pin off / on](docs/topmost-pin-off-on.png)
+- **細いタイトルバーボタン（v1.2.0）**: タイトルバーを自前で描き、最小化・最大化・閉じる を Windows 11 と同じ見た目のまま幅 32px（標準 46px）に。アクティブ = 白 / 非アクティブ = 灰色、ホバー・押下・閉じるの赤、スナップレイアウトも標準どおり。グリフは Windows の Segoe Fluent Icons（無ければ Segoe MDL2 Assets）を使用
+- **狭い幅に対応（v1.2.0）**: 最小幅を約 200 に。狭くすると色ボタンの間隔を詰め、タイトルは省略（…）→ 非表示の順で場所を譲ります
+- **スクロールの手がかり（v1.2.0）**: 本文が上（下）に続いているとき、枠の上辺（下辺）が少し明るい赤になります
 - 複数起動すると、それぞれ別のメモ（`StickyBB.rtf`, `StickyBB-2.rtf`, …）として開きます。位置・タイトル・倍率・最前面はウィンドウごとに `StickyBB.ini` に保存されます
 - 貼り付けは書式なしテキスト（フォントが混ざって細く見えるのを防ぐため）
 
@@ -66,5 +69,7 @@ Visual Studio の場合は `StickyBB.c` と `StickyBB.rc` をプロジェクト�
 StickyBB is a small chalkboard-style sticky-note app for Windows (single exe, plain C/Win32, RichEdit).
 Features: 7 chalk ink colours, safe auto-save (every 30 min, on close, on shutdown/sign-out), unsaved mark, `#title` first line sets the window title,
 per-window zoom (Ctrl+; or Ctrl+= / Ctrl+- / Ctrl+0, display-only so colours and the saved RTF are unchanged),
-and a per-window "always on top" pin toggle in the title bar. Multiple instances keep separate notes; per-window settings live in `StickyBB.ini` next to the exe.
+a per-window "always on top" pin toggle in the title bar,
+a custom-drawn Windows 11 style title bar with narrower (32 px) caption buttons, a layout that packs the colour buttons and hides the title on narrow windows,
+and a subtle scroll hint (the top/bottom frame brightens when there is more text above/below). Multiple instances keep separate notes; per-window settings live in `StickyBB.ini` next to the exe.
 Build with `./build.sh` (MinGW-w64). Licensed under the MIT License.

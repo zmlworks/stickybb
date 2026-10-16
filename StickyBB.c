@@ -44,8 +44,32 @@
 #define COL_BG     RGB(0x00, 0x22, 0x18)
 #define COL_FG     RGB(0xD3, 0xD3, 0xD3)
 #define COL_TITLE  RGB(0x3D, 0x01, 0x05)
-#define COL_PIN_OFF RGB(0x8B, 0x91, 0x8B)   /* 追加(v1.1): 最前面ピン オフ時 */
-#define COL_PIN_HOT RGB(0x5A, 0x16, 0x1C)   /* 追加(v1.1): ピンのホバー/オン背景 */
+#define COL_PIN_HOT RGB(0x5A, 0x16, 0x1C)   /* 追加(v1.1): ピンのオン背景 */
+
+/* ---- 追加(v1.2): 自前で描くタイトルバー ----
+   Win11 の標準キャプション (DWM が描く) と同じ見た目・動作を、ボタン幅だけ狭くして再現する。
+   サイズは論理px (96DPI 基準)。GetDpiForWindow の値で換算するが、このアプリは DPI 非対応
+   (Windows が拡大表示) のままなので、実際には常に 96 として扱われる (表示は従来どおり)。 */
+#define CAPBTN_W        32    /* キャプションボタンの幅 (標準は 46) */
+#define CAP_GLYPH_PX    10    /* 最小化/最大化/閉じる のグリフの大きさ (標準と同じ) */
+#define PIN_GLYPH_PX    16    /* ピンのグリフ (16px で線の太さ 1px = 他のボタンと同じ) */
+#define CAP_ICON_PX     16
+#define CAP_PAD         8     /* アイコン/タイトルの左右余白 */
+#define TITLE_MIN_W     40    /* タイトルを省略表示 (…) してでも出す最小幅。これ未満なら隠す */
+#define SWATCH_MARGIN   4     /* 色ボタン列の左右の最小余白 */
+#define COL_GLYPH       RGB(0xFF, 0xFF, 0xFF)   /* アクティブ時のグリフ */
+#define INACTIVE_ALPHA  100   /* 非アクティブ時: 白を 100/255 (≈39%) で重ねた色 = #896466 (実測値) */
+#define HOVER_ALPHA     15    /* ホバー背景: 白 6% (Win11 SubtleFillColorSecondary) */
+#define PRESS_ALPHA     10    /* 押下背景:   白 4% (Win11 SubtleFillColorTertiary) */
+#define COL_CLOSE_HOT   RGB(0xC4, 0x2B, 0x1C)   /* 閉じる ホバー (Win11 と同じ) */
+#define CLOSE_PRESS_ALPHA 230 /* 閉じる 押下: #C42B1C を 90% */
+#define PRESS_GLYPH_ALPHA 200 /* 押下中のグリフは少し暗く */
+/* 追加(v1.2): スクロールの手がかり (枠の上下を少し明るく) */
+#define HINT_PX         3
+#define COL_HINT        RGB(0x6A, 0x1A, 0x20)
+#define WM_APP_HINT     (WM_APP + 3)
+
+enum { CB_NONE = 0, CB_PIN, CB_MIN, CB_MAX, CB_CLOSE };
 
 /* 追加(v1.1): 表示倍率 (EM_SETZOOM, 単位 %) */
 #define ZOOM_MIN   50
@@ -54,8 +78,6 @@
 #define ID_ZOOM_IN    301
 #define ID_ZOOM_OUT   302
 #define ID_ZOOM_RESET 303
-#define WM_APP_PIN    (WM_APP + 1)
-#define WM_APP_TOPMOST (WM_APP + 2)
 
 static const COLORREF kInk[INK_COUNT] = {
     /* 変更: 並び順 c1, c3, #B56B85(新), c4, c5, c6, c2 */
@@ -86,9 +108,18 @@ static HANDLE  gMutex = NULL;
 static WNDPROC gEditPrev = NULL;
 static int     gZoom = 100;          /* 追加(v1.1): このウィンドウの表示倍率 % (INI: zoom=) */
 static int     gTopmost = 0;         /* 追加(v1.1): 最前面に表示 (INI: topmost=) */
-static HWND    gPin = NULL;          /* 追加(v1.1): タイトルバー上のピン (所有ポップアップ) */
-static HWND    gPinTip = NULL;
-static int     gPinHot = 0;
+/* 追加(v1.2): 自前のキャプション */
+static int     gCapH = 31;           /* キャプションの高さ (クライアント座標, WM_NCCALCSIZE で決まる) */
+static int     gActive = 0;          /* WM_NCACTIVATE で更新 */
+static int     gHot = CB_NONE;       /* マウスが乗っているボタン */
+static int     gPressed = CB_NONE;   /* 押しているボタン (キャプチャ中) */
+static int     gTrackNC = 0, gTrackC = 0;
+static HFONT   gCapFont, gGlyphFont, gPinFont;
+static int     gGlyphFontOK = 0;     /* 1: Segoe Fluent Icons / Segoe MDL2 Assets が使える */
+static HICON   gIconSm;
+static HWND    gTip = NULL;          /* キャプションボタンのツールチップ */
+static int     gHintUp = 0, gHintDown = 0, gHintPosted = 0;
+static int     gLineH = 27;          /* 1行の高さの目安 (100%) */
 
 
 
@@ -127,14 +158,14 @@ static void IniPath(void)
 }
 
 /* 追加: 未保存マーク付きでウィンドウタイトル(=タスクバー名)を更新。
-   キャプションは DWM が描く標準のものなので、タイトル文字列の先頭に「● 」を付ける */
+   タイトル文字列の先頭に「● 」を付ける (v1.2: キャプションは自前で描くが、文字列は同じものを使う) */
 static void UpdateTitle(void)
 {
     wchar_t buf[TITLE_MAX + 8];
     if (!gMain) return;
     lstrcpyW(buf, gDirty ? L"\x25CF " : L"");
     lstrcatW(buf, gUserTitle[0] ? gUserTitle : gTitle);
-    SetWindowTextW(gMain, buf);
+    SetWindowTextW(gMain, buf);   /* WM_SETTEXT でキャプションを描き直す */
 }
 
 static void SetDirty(int d)
@@ -159,6 +190,7 @@ static void IniWriteInt(const wchar_t *sec, const wchar_t *key, int v)
 }
 
 static void HideEditBar(void);
+static void PostHint(void);
 
 /* ---- 追加(v1.1): 表示倍率 ----
    RichEdit の EM_SETZOOM で表示だけを拡大/縮小する。文字ごとの色・書式や
@@ -170,6 +202,7 @@ static void ApplyZoom(void)
     SendMessageW(gEdit, EM_SETZOOM, (WPARAM)gZoom, (LPARAM)100);
     InvalidateRect(gEdit, NULL, TRUE);
     HideEditBar();
+    PostHint();
 }
 
 static void SetZoom(int z)
@@ -230,7 +263,7 @@ static void ClampRect(RECT *r)
     if (!GetMonitorInfoW(mon, &mi)) return;
     w = r->right - r->left;
     h = r->bottom - r->top;
-    if (w < 300) w = 300;
+    if (w < 200) w = 200;   /* 変更(v1.2): 300 → 200 (狭くしたとき色ボタンを詰める) */
     if (h < 160) h = 160;
     if (r->left < mi.rcWork.left) { r->left = mi.rcWork.left; r->right = r->left + w; }
     if (r->top < mi.rcWork.top) { r->top = mi.rcWork.top; r->bottom = r->top + h; }
@@ -279,10 +312,12 @@ static void WheelScroll(WPARAM wp)
     if (lines == 0) return;
     if (lines == WHEEL_PAGESCROLL) {
         SendMessageW(gEdit, EM_SCROLL, (delta > 0) ? SB_PAGEUP : SB_PAGEDOWN, 0);
+        PostHint();
         return;
     }
     n = -(delta / WHEEL_DELTA) * (int)lines;
     if (n) SendMessageW(gEdit, EM_LINESCROLL, 0, n);
+    PostHint();
 }
 
 static int ClaimSlot(void)
@@ -545,18 +580,32 @@ static void ColorCaption(HWND hwnd)
     FreeLibrary(m);
 }
 
+/* 変更(v1.2): 幅が足りないときは色ボタンの間隔を詰める (最大 SWATCH_GAP, 最小 0) */
+static int SwatchGap(int cw)
+{
+    int spare = cw - BORDER * 2 - SWATCH_MARGIN * 2 - INK_COUNT * SWATCH_BOX;
+    int gap = spare / (INK_COUNT - 1);
+    if (gap > SWATCH_GAP) gap = SWATCH_GAP;
+    if (gap < 0) gap = 0;
+    return gap;
+}
+
+static void UpdateTipRects(HWND hwnd);
+
 static void Layout(HWND hwnd)
 {
     RECT rc; GetClientRect(hwnd, &rc);
+    /* 変更(v1.2): キャプションをクライアント領域に描くので、その分 (gCapH) 下げる */
+    int top = gCapH + BORDER + PAD;
     int editBottom = rc.bottom - BORDER - BAR_H;
     MoveWindow(gEdit,
                BORDER + PAD,
-               BORDER + PAD,
+               top,
                rc.right - BORDER * 2 - PAD * 2,
-               editBottom - BORDER - PAD,
+               editBottom - top,
                TRUE);
     {
-        int gap = SWATCH_GAP, box = SWATCH_BOX;
+        int gap = SwatchGap(rc.right), box = SWATCH_BOX;
         int total = INK_COUNT * box + (INK_COUNT - 1) * gap;
         int x0 = (rc.right - total) / 2;
         int y0 = rc.bottom - BORDER - (BAR_H + box) / 2;
@@ -564,6 +613,7 @@ static void Layout(HWND hwnd)
         for (i = 0; i < INK_COUNT; i++)
             MoveWindow(gSwatch[i], x0 + i * (box + gap), y0, box, box, TRUE);
     }
+    UpdateTipRects(hwnd);
 }
 
 static void ShowEditMenu(HWND edit, int sx, int sy)
@@ -623,6 +673,7 @@ static LRESULT CALLBACK EditProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     if (msg == WM_LBUTTONUP || msg == WM_KEYUP) {
         LRESULT r = CallWindowProcW(gEditPrev, hw, msg, wp, lp);
         ReapplyInkIfCaret();
+        PostHint();
         return r;
     }
     if (msg == WM_MOUSEWHEEL) {
@@ -683,236 +734,641 @@ static LRESULT CALLBACK SwatchProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hw, msg, wp, lp);
 }
 
-/* ---- 追加(v1.1): 最前面に表示 (タイトルバーのピン) ----
-   キャプションは DWM が描く標準のもの (色だけ DwmSetWindowAttribute で変更) なので、
-   非クライアント領域に直接描いても表示されない。そこで小さな所有ポップアップ
-   (オーナー = メインウィンドウ) を最小化ボタンの左隣に重ねて置く。
-   所有ウィンドウなので、常にオーナーの直上に重なり、最小化で一緒に隠れ、最前面も一緒になる。 */
+/* ---- 追加(v1.2): 自前のタイトルバー (キャプション) ----
+   WM_NCCALCSIZE でクライアント領域をタイトルバーの位置まで広げ (左右下のリサイズ枠は残す)、
+   タイトルバーをクライアント領域に自分で描く。Win11 の枠線・影・角丸は DWM がそのまま付ける
+   (左右下の枠を残しているので DwmExtendFrameIntoClientArea は不要。広げると DWM が
+   標準のボタンを描いてしまうため使わない)。
+   右から 閉じる・最大化・最小化・ピン の順に並べ、残りがアイコンとタイトル (ドラッグ領域)。
+   幅が足りないときはタイトルから省略・非表示にする (優先度: キャプションボタン > ピン > タイトル)。 */
 static void SetTopmost(int on, int save);
 
-static void PinTipText(void)
+static COLORREF Blend(COLORREF fg, COLORREF bg, int a)   /* a = fg の割合 0..255 */
 {
-    TOOLINFOW ti;
-    if (!gPinTip) return;
-    ZeroMemory(&ti, sizeof(ti));
-    ti.cbSize = sizeof(ti);
-    ti.hwnd = gPin;
-    ti.uId = (UINT_PTR)gPin;
-    ti.lpszText = gTopmost ? L"最前面に表示: オン（クリックで解除）"
-                           : L"最前面に表示: オフ（クリックで常に手前に表示）";
-    SendMessageW(gPinTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    return RGB((GetRValue(fg) * a + GetRValue(bg) * (255 - a) + 127) / 255,
+               (GetGValue(fg) * a + GetGValue(bg) * (255 - a) + 127) / 255,
+               (GetBValue(fg) * a + GetBValue(bg) * (255 - a) + 127) / 255);
 }
 
-static void PositionPin(void)
+static UINT WinDpi(HWND h)
 {
-    TITLEBARINFOEX tb;
-    RECT btn;
-    int w, h;
-    if (!gPin || !gMain) return;
-    if (IsIconic(gMain) || !IsWindowVisible(gMain)) return;
-    ZeroMemory(&tb, sizeof(tb));
-    tb.cbSize = sizeof(tb);
-    SendMessageW(gMain, WM_GETTITLEBARINFOEX, 0, (LPARAM)&tb);
-    btn = tb.rgrect[2];                         /* 最小化ボタン */
-    if (btn.right <= btn.left || btn.bottom <= btn.top) {
-        /* 予備: WM_GETTITLEBARINFOEX が使えない環境 (Wine など) */
-        TITLEBARINFO t;
-        int bw = GetSystemMetrics(SM_CXSIZE);
-        ZeroMemory(&t, sizeof(t));
-        t.cbSize = sizeof(t);
-        if (!GetTitleBarInfo(gMain, &t)) return;
-        btn.right  = t.rcTitleBar.right - bw * 2;
-        btn.left   = btn.right - bw;
-        btn.top    = t.rcTitleBar.top;
-        btn.bottom = t.rcTitleBar.bottom;
+    typedef UINT (WINAPI *FN)(HWND);
+    static FN fn = NULL;
+    static int init = 0;
+    UINT d = 0;
+    if (!init) {
+        init = 1;
+        fn = (FN)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
     }
-    h = btn.bottom - btn.top;
-    if (h < 16) h = 16;
-    w = h + 6; if (w < 26) w = 26; if (w > 40) w = 40;
-    {   /* オーナーのすぐ上に重ねる (他のウィンドウより手前には出さない)。
-           ピンの最前面属性はオーナーと必ず揃える: ずれた位置に挿入すると
-           Windows がオーナーごと最前面を外してしまうため */
-        HWND after = GetWindow(gMain, GW_HWNDPREV);
-        UINT f = SWP_NOACTIVATE | SWP_SHOWWINDOW;
-        if (after == gPin)
-            f |= SWP_NOZORDER;
+    if (fn && h) d = fn(h);
+    return d ? d : 96;   /* DPI 非対応のプロセスでは常に 96 (Windows が拡大表示する) */
+}
+
+static int SysMetric(int idx, UINT dpi)
+{
+    typedef int (WINAPI *FN)(int, UINT);
+    static FN fn = NULL;
+    static int init = 0;
+    if (!init) {
+        init = 1;
+        fn = (FN)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi");
+    }
+    return fn ? fn(idx, dpi) : GetSystemMetrics(idx);
+}
+
+static int Sc(int v) { return MulDiv(v, (int)WinDpi(gMain), 96); }
+
+static int CALLBACK FontFoundProc(const LOGFONTW *lf, const TEXTMETRICW *tm, DWORD type, LPARAM lp)
+{
+    (void)lf; (void)tm; (void)type;
+    *(int *)lp = 1;
+    return 0;
+}
+
+static int FontExists(const wchar_t *face)
+{
+    LOGFONTW lf;
+    int found = 0;
+    HDC dc = GetDC(NULL);
+    ZeroMemory(&lf, sizeof(lf));
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lstrcpynW(lf.lfFaceName, face, LF_FACESIZE);
+    EnumFontFamiliesExW(dc, &lf, (FONTENUMPROCW)FontFoundProc, (LPARAM)&found, 0);
+    ReleaseDC(NULL, dc);
+    return found;
+}
+
+static int GlyphsPresent(HFONT f, const wchar_t *s)
+{
+    WORD idx[8];
+    int n = lstrlenW(s), i, ok = 1;
+    HDC dc = GetDC(NULL);
+    HGDIOBJ of = SelectObject(dc, f);
+    if (n > 8 || GetGlyphIndicesW(dc, s, n, idx, GGI_MARK_NONEXISTING_GLYPHS) == GDI_ERROR) ok = 0;
+    for (i = 0; ok && i < n; i++)
+        if (idx[i] == 0xFFFF) ok = 0;
+    SelectObject(dc, of);
+    ReleaseDC(NULL, dc);
+    return ok;
+}
+
+/* タイトル文字のフォント (システムのキャプションフォント) と、ボタンのグリフ用フォント。
+   グリフは Segoe Fluent Icons (Win11) → Segoe MDL2 Assets (Win10) の順に探し、
+   どちらも無ければ自前のベクター描画 (線の太さは同じ 1 論理px) にする。フォントは同梱しない。 */
+static void CreateCaptionFonts(HWND hwnd)
+{
+    static const wchar_t *faces[2] = { L"Segoe Fluent Icons", L"Segoe MDL2 Assets" };
+    UINT dpi = WinDpi(hwnd);
+    NONCLIENTMETRICSW nm;
+    int i;
+    if (gCapFont) { DeleteObject(gCapFont); gCapFont = NULL; }
+    if (gGlyphFont) { DeleteObject(gGlyphFont); gGlyphFont = NULL; }
+    if (gPinFont) { DeleteObject(gPinFont); gPinFont = NULL; }
+    ZeroMemory(&nm, sizeof(nm));
+    nm.cbSize = sizeof(nm);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(nm), &nm, 0)) {
+        if (dpi != 96) nm.lfCaptionFont.lfHeight = MulDiv(nm.lfCaptionFont.lfHeight, (int)dpi, 96);
+        gCapFont = CreateFontIndirectW(&nm.lfCaptionFont);
+    }
+    gGlyphFontOK = 0;
+    for (i = 0; i < 2 && !gGlyphFontOK; i++) {
+        if (!FontExists(faces[i])) continue;
+        gGlyphFont = CreateFontW(-MulDiv(CAP_GLYPH_PX, (int)dpi, 96), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                 DEFAULT_CHARSET, OUT_TT_PRECIS, 0, ANTIALIASED_QUALITY,
+                                 DEFAULT_PITCH, faces[i]);
+        gPinFont = CreateFontW(-MulDiv(PIN_GLYPH_PX, (int)dpi, 96), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                               DEFAULT_CHARSET, OUT_TT_PRECIS, 0, ANTIALIASED_QUALITY,
+                               DEFAULT_PITCH, faces[i]);
+        if (gGlyphFont && gPinFont &&
+            GlyphsPresent(gGlyphFont, L"\xE921\xE922\xE923\xE8BB") &&
+            GlyphsPresent(gPinFont, L"\xE718\xE842"))
+            gGlyphFontOK = 1;
         else {
-            int ownerTop = (GetWindowLongW(gMain, GWL_EXSTYLE) & WS_EX_TOPMOST) ? 1 : 0;
-            if (!after || ((GetWindowLongW(after, GWL_EXSTYLE) & WS_EX_TOPMOST) ? 1 : 0) != ownerTop)
-                after = ownerTop ? HWND_TOPMOST : HWND_TOP;
+            if (gGlyphFont) { DeleteObject(gGlyphFont); gGlyphFont = NULL; }
+            if (gPinFont) { DeleteObject(gPinFont); gPinFont = NULL; }
         }
-        SetWindowPos(gPin, after, btn.left - w - 2, btn.top, w, h, f);
     }
 }
 
+typedef struct {
+    RECT btn[5];        /* CB_PIN..CB_CLOSE */
+    RECT icon, text;
+    int  showIcon;
+} CapLayout;
 
-/* 画鋲アイコン。4倍の大きさで描いてから縮小 (HALFTONE) し、輪郭をなめらかにする。
-   オン: インク選択色で塗りつぶし・まっすぐ (刺さっている) / オフ: グレーの輪郭・45度傾き */
-static void DrawPin(HDC dc, int cw, int ch)
+static void CalcCaption(int cw, CapLayout *L)
 {
-    const int S = 4;
-    int W = cw * S, H = ch * S, i;
-    HDC m = CreateCompatibleDC(dc);
-    HBITMAP bmp = CreateCompatibleBitmap(dc, W, H);
-    HGDIOBJ ob = SelectObject(m, bmp);
-    RECT r = { 0, 0, W, H };
-    HBRUSH bg = CreateSolidBrush(COL_TITLE);
-    COLORREF col = gTopmost ? COL_INK_SEL : COL_PIN_OFF;
-    /* 単位 = アイコン高さ 16 を基準とした座標 (中心 0,0) */
-    static const float shape[][2] = {
-        { -3.5f, -7.0f }, { 3.5f, -7.0f }, { 2.5f, -5.5f }, { 2.5f, -1.0f },
-        { 5.0f, 1.5f }, { -5.0f, 1.5f }, { -2.5f, -1.0f }, { -2.5f, -5.5f }
-    };
-    POINT pt[8], nd[2];
-    float k = (float)(ch < cw ? ch : cw) * S / 22.0f;
-    float cs = gTopmost ? 1.0f : 0.7071f, sn = gTopmost ? 0.0f : 0.7071f;
-    float cx = W / 2.0f, cy = H / 2.0f + k * 0.5f;
-    HPEN pen;
-    HBRUSH fill;
-    HGDIOBJ op, obr;
+    int bw = Sc(CAPBTN_W), h = gCapH, x = cw, b;
+    int pad = Sc(CAP_PAD), ic = Sc(CAP_ICON_PX);
+    ZeroMemory(L, sizeof(*L));
+    for (b = CB_CLOSE; b >= CB_PIN; b--) {      /* 右から 閉じる, 最大化, 最小化, ピン */
+        SetRect(&L->btn[b], x - bw, 0, x, h);
+        x -= bw;
+    }
+    L->showIcon = (x >= pad + ic + pad);
+    if (L->showIcon)
+        SetRect(&L->icon, pad, (h - ic) / 2, pad + ic, (h - ic) / 2 + ic);
+    SetRect(&L->text, L->showIcon ? pad + ic + pad : pad, 0, x - pad, h);
+}
 
-    FillRect(m, &r, bg);
-    if (gTopmost || gPinHot) {
-        HBRUSH hb = CreateSolidBrush(COL_PIN_HOT);
-        HGDIOBJ o1 = SelectObject(m, hb), o2 = SelectObject(m, GetStockObject(NULL_PEN));
-        RoundRect(m, S * 2, S * 2, W - S * 2, H - S * 2, S * 8, S * 8);
-        SelectObject(m, o1); SelectObject(m, o2);
-        DeleteObject(hb);
-    }
-    for (i = 0; i < 8; i++) {
-        float x = shape[i][0] * k, y = shape[i][1] * k;
-        pt[i].x = (LONG)(cx + x * cs - y * sn);
-        pt[i].y = (LONG)(cy + x * sn + y * cs);
-    }
-    {
-        float y0 = 1.5f * k, y1 = 7.0f * k;
-        nd[0].x = (LONG)(cx - y0 * sn); nd[0].y = (LONG)(cy + y0 * cs);
-        nd[1].x = (LONG)(cx - y1 * sn); nd[1].y = (LONG)(cy + y1 * cs);
-    }
-    pen = CreatePen(PS_SOLID, (int)(k * 1.4f) + 1, col);
-    fill = gTopmost ? CreateSolidBrush(col) : NULL;
-    op = SelectObject(m, pen);
-    obr = SelectObject(m, fill ? (HGDIOBJ)fill : GetStockObject(NULL_BRUSH));
-    Polygon(m, pt, 8);
-    MoveToEx(m, nd[0].x, nd[0].y, NULL);
-    LineTo(m, nd[1].x, nd[1].y);
-    SelectObject(m, op); SelectObject(m, obr);
-    DeleteObject(pen);
-    if (fill) DeleteObject(fill);
+/* クライアント座標 pt にあるボタン */
+static int CapButtonAt(HWND hwnd, POINT pt)
+{
+    RECT rc;
+    CapLayout L;
+    int b;
+    if (pt.y < 0 || pt.y >= gCapH) return CB_NONE;
+    GetClientRect(hwnd, &rc);
+    CalcCaption(rc.right, &L);
+    for (b = CB_PIN; b <= CB_CLOSE; b++)
+        if (PtInRect(&L.btn[b], pt)) return b;
+    return CB_NONE;
+}
 
-    SetStretchBltMode(dc, HALFTONE);
-    SetBrushOrgEx(dc, 0, 0, NULL);
-    StretchBlt(dc, 0, 0, cw, ch, m, 0, 0, W, H, SRCCOPY);
+static LRESULT CaptionHitTest(HWND hwnd, POINT pt)
+{
+    RECT rc;
+    CapLayout L;
+    if (pt.y < 0 || pt.y >= gCapH) return HTCLIENT;
+    GetClientRect(hwnd, &rc);
+    if (!IsZoomed(hwnd)) {   /* 上端はリサイズ */
+        UINT dpi = WinDpi(hwnd);
+        int edge = SysMetric(SM_CYFRAME, dpi), corner = Sc(16);
+        if (pt.y < edge) {
+            if (pt.x < corner) return HTTOPLEFT;
+            if (pt.x >= rc.right - corner) return HTTOPRIGHT;
+            return HTTOP;
+        }
+    }
+    switch (CapButtonAt(hwnd, pt)) {
+    case CB_MIN:   return HTMINBUTTON;
+    case CB_MAX:   return HTMAXBUTTON;    /* Win11 のスナップレイアウトが出る */
+    case CB_CLOSE: return HTCLOSE;
+    case CB_PIN:   return HTCLIENT;       /* ピンは普通のクライアントのボタン */
+    }
+    CalcCaption(rc.right, &L);
+    if (L.showIcon && pt.x >= 0 && pt.x < L.icon.right + Sc(4)) return HTSYSMENU;
+    return HTCAPTION;
+}
+
+static void InvalidateCaption(HWND hwnd)
+{
+    RECT rc;
+    if (!hwnd) return;
+    GetClientRect(hwnd, &rc);
+    rc.bottom = gCapH;
+    InvalidateRect(hwnd, &rc, FALSE);
+}
+
+static void SetHot(HWND hwnd, int b)
+{
+    if (gHot == b) return;
+    gHot = b;
+    InvalidateCaption(hwnd);
+}
+
+/* Win11 の標準キャプションボタンと同じ配色 */
+static void CapButtonColors(int b, COLORREF *bg, COLORREF *fg)
+{
+    int hot = (gHot == b), pressed = (gPressed == b && hot);
+    *bg = COL_TITLE;
+    *fg = gActive ? COL_GLYPH : Blend(COL_GLYPH, COL_TITLE, INACTIVE_ALPHA);
+    if (b == CB_CLOSE) {
+        if (pressed) {
+            *bg = Blend(COL_CLOSE_HOT, COL_TITLE, CLOSE_PRESS_ALPHA);
+            *fg = Blend(COL_GLYPH, *bg, PRESS_GLYPH_ALPHA);
+        } else if (hot) {
+            *bg = COL_CLOSE_HOT;
+            *fg = COL_GLYPH;
+        }
+    } else {
+        if (pressed) {
+            *bg = Blend(COL_GLYPH, COL_TITLE, PRESS_ALPHA);
+            *fg = Blend(COL_GLYPH, *bg, PRESS_GLYPH_ALPHA);
+        } else if (hot) {
+            *bg = Blend(COL_GLYPH, COL_TITLE, HOVER_ALPHA);
+            *fg = COL_GLYPH;
+        }
+    }
+}
+
+static void FillPx(HDC dc, int l, int t, int r, int b, int S, HBRUSH br)
+{
+    RECT q;
+    SetRect(&q, l * S, t * S, r * S, b * S);
+    FillRect(dc, &q, br);
+}
+
+/* フォントが無い環境用のベクター描画 (4倍で描いてから縮小)。
+   線の太さはすべて 1 論理px (= Segoe のキャプショングリフと同じ)。
+   S = 倍率 (4), u = 1 論理px あたりの実ピクセル (DPI), cx/cy = 中心 (縮小後の px) */
+static void DrawVectorGlyph(HDC m, int b, int w, int h, int S, COLORREF fg)
+{
+    float u = (float)WinDpi(gMain) / 96.0f;
+    int cx = w / 2, cy = h / 2;
+    int g = (int)(5 * u + 0.5f), t = (int)(u + 0.5f);   /* 半径 5px, 線 1px */
+    HBRUSH br = CreateSolidBrush(fg);
+    if (t < 1) t = 1;
+    switch (b) {
+    case CB_MIN:
+        FillPx(m, cx - g, cy, cx + g, cy + t, S, br);
+        break;
+    case CB_MAX:
+        if (IsZoomed(gMain)) {   /* 元に戻す: 前の四角 8x8 + 後ろの四角の見える部分 */
+            int o = (int)(2 * u + 0.5f);
+            int l = cx - g, tp = cy - g + o, r = cx + g - o, bt = cy + g;
+            FillPx(m, l, tp, r, tp + t, S, br);
+            FillPx(m, l, bt - t, r, bt, S, br);
+            FillPx(m, l, tp, l + t, bt, S, br);
+            FillPx(m, r - t, tp, r, bt, S, br);
+            FillPx(m, l + o, cy - g, cx + g, cy - g + t, S, br);      /* 後ろの上辺 */
+            FillPx(m, cx + g - t, cy - g, cx + g, bt - o, S, br);      /* 後ろの右辺 */
+            FillPx(m, l + o, cy - g, l + o + t, tp, S, br);
+            FillPx(m, r, bt - o - t, cx + g, bt - o, S, br);
+        } else {
+            FillPx(m, cx - g, cy - g, cx + g, cy - g + t, S, br);
+            FillPx(m, cx - g, cy + g - t, cx + g, cy + g, S, br);
+            FillPx(m, cx - g, cy - g, cx - g + t, cy + g, S, br);
+            FillPx(m, cx + g - t, cy - g, cx + g, cy + g, S, br);
+        }
+        break;
+    case CB_CLOSE: {
+        LOGBRUSH lb;
+        HPEN pen;
+        HGDIOBJ op;
+        lb.lbStyle = BS_SOLID; lb.lbColor = fg; lb.lbHatch = 0;
+        pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_FLAT, (DWORD)(t * S), &lb, 0, NULL);
+        op = SelectObject(m, pen);
+        MoveToEx(m, (cx - g) * S, (cy - g) * S, NULL); LineTo(m, (cx + g) * S, (cy + g) * S);
+        MoveToEx(m, (cx + g) * S, (cy - g) * S, NULL); LineTo(m, (cx - g) * S, (cy + g) * S);
+        SelectObject(m, op);
+        DeleteObject(pen);
+        break;
+    }
+    case CB_PIN: {
+        /* 画鋲 (高さ約 14px)。オフ: 45度傾いた輪郭 / オン: まっすぐ・塗りつぶし */
+        static const float shape[][2] = {
+            { -3.5f, -7.0f }, { 3.5f, -7.0f }, { 2.5f, -5.5f }, { 2.5f, -1.0f },
+            { 5.0f, 1.5f }, { -5.0f, 1.5f }, { -2.5f, -1.0f }, { -2.5f, -5.5f }
+        };
+        POINT pt[8], nd[2];
+        float k = u * S, cs = gTopmost ? 1.0f : 0.7071f, sn = gTopmost ? 0.0f : 0.7071f;
+        float fx = cx * (float)S, fy = (cy + 0.5f) * (float)S;
+        LOGBRUSH lb;
+        HPEN pen;
+        HBRUSH fill;
+        HGDIOBJ op, ob;
+        int i;
+        for (i = 0; i < 8; i++) {
+            float x = shape[i][0] * k, y = shape[i][1] * k;
+            pt[i].x = (LONG)(fx + x * cs - y * sn);
+            pt[i].y = (LONG)(fy + x * sn + y * cs);
+        }
+        nd[0].x = (LONG)(fx - 1.5f * k * sn); nd[0].y = (LONG)(fy + 1.5f * k * cs);
+        nd[1].x = (LONG)(fx - 7.0f * k * sn); nd[1].y = (LONG)(fy + 7.0f * k * cs);
+        lb.lbStyle = BS_SOLID; lb.lbColor = fg; lb.lbHatch = 0;
+        pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_FLAT | PS_JOIN_MITER,
+                           (DWORD)(t * S), &lb, 0, NULL);
+        fill = gTopmost ? CreateSolidBrush(fg) : NULL;
+        op = SelectObject(m, pen);
+        ob = SelectObject(m, fill ? (HGDIOBJ)fill : GetStockObject(NULL_BRUSH));
+        Polygon(m, pt, 8);
+        MoveToEx(m, nd[0].x, nd[0].y, NULL);
+        LineTo(m, nd[1].x, nd[1].y);
+        SelectObject(m, op); SelectObject(m, ob);
+        DeleteObject(pen);
+        if (fill) DeleteObject(fill);
+        break;
+    }
+    }
+    DeleteObject(br);
+}
+
+/* Segoe Fluent Icons / MDL2 のグリフを、黒い部分 (black box) の中心がボタンの中心に来るよう描く */
+static void DrawFontGlyph(HDC dc, const RECT *r, int b, COLORREF fg)
+{
+    wchar_t ch = 0;
+    HFONT f = (b == CB_PIN) ? gPinFont : gGlyphFont;
+    GLYPHMETRICS gm;
+    MAT2 mat;
+    HGDIOBJ of;
+    int cx = (r->left + r->right) / 2, cy = (r->top + r->bottom) / 2;
+    switch (b) {
+    case CB_PIN:   ch = gTopmost ? 0xE842 /* PinnedFill */ : 0xE718 /* Pin */; break;
+    case CB_MIN:   ch = 0xE921; break;
+    case CB_MAX:   ch = IsZoomed(gMain) ? 0xE923 : 0xE922; break;
+    case CB_CLOSE: ch = 0xE8BB; break;
+    }
+    if (!ch || !f) return;
+    of = SelectObject(dc, f);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, fg);
+    ZeroMemory(&mat, sizeof(mat));
+    mat.eM11.value = 1; mat.eM22.value = 1;
+    if (GetGlyphOutlineW(dc, ch, GGO_METRICS, &gm, 0, NULL, &mat) != GDI_ERROR && gm.gmBlackBoxX > 0) {
+        UINT oa = SetTextAlign(dc, TA_BASELINE | TA_LEFT);
+        int x = cx - (int)gm.gmBlackBoxX / 2 - gm.gmptGlyphOrigin.x;
+        int y = cy - (int)gm.gmBlackBoxY / 2 + gm.gmptGlyphOrigin.y;
+        ExtTextOutW(dc, x, y, 0, NULL, &ch, 1, NULL);
+        SetTextAlign(dc, oa);
+    } else {
+        RECT t = *r;
+        DrawTextW(dc, &ch, 1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    SelectObject(dc, of);
+}
+
+static void DrawCapButton(HDC dc, const RECT *r, int b)
+{
+    COLORREF bg, fg;
+    int w = r->right - r->left, h = r->bottom - r->top;
+    int onBg = (b == CB_PIN && gTopmost);
+    if (w <= 0 || h <= 0) return;
+    CapButtonColors(b, &bg, &fg);
+    if (!gGlyphFontOK || onBg) {
+        const int S = 4;
+        HDC m = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, w * S, h * S);
+        HGDIOBJ ob = SelectObject(m, bmp);
+        RECT q = { 0, 0, w * S, h * S };
+        HBRUSH br = CreateSolidBrush(bg);
+        FillRect(m, &q, br);
+        DeleteObject(br);
+        if (onBg) {   /* オン: 角丸の背景 #5A161C (v1.1 と同じ色) */
+            int in = Sc(3), rr = Sc(8);
+            HBRUSH hb = CreateSolidBrush(gHot == b ? Blend(COL_GLYPH, COL_PIN_HOT, HOVER_ALPHA) : COL_PIN_HOT);
+            HGDIOBJ o1 = SelectObject(m, hb), o2 = SelectObject(m, GetStockObject(NULL_PEN));
+            RoundRect(m, in * S, in * S, (w - in) * S + 1, (h - in) * S + 1, rr * S, rr * S);
+            SelectObject(m, o1); SelectObject(m, o2);
+            DeleteObject(hb);
+        }
+        if (!gGlyphFontOK) DrawVectorGlyph(m, b, w, h, S, fg);
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, NULL);
+        StretchBlt(dc, r->left, r->top, w, h, m, 0, 0, w * S, h * S, SRCCOPY);
+        SelectObject(m, ob);
+        DeleteObject(bmp);
+        DeleteDC(m);
+    } else {
+        HBRUSH br = CreateSolidBrush(bg);
+        FillRect(dc, r, br);
+        DeleteObject(br);
+    }
+    if (gGlyphFontOK) DrawFontGlyph(dc, r, b, fg);
+}
+
+/* キャプション全体を裏で描いてから一度に転送する (ちらつき防止) */
+static void PaintCaption(HWND hwnd, HDC dc, int cw)
+{
+    int h = gCapH, b;
+    CapLayout L;
+    HDC m;
+    HBITMAP bmp;
+    HGDIOBJ ob;
+    RECT r;
+    wchar_t t[TITLE_MAX + 16];
+    int n;
+    if (cw <= 0 || h <= 0) return;
+    CalcCaption(cw, &L);
+    m = CreateCompatibleDC(dc);
+    bmp = CreateCompatibleBitmap(dc, cw, h);
+    ob = SelectObject(m, bmp);
+    SetRect(&r, 0, 0, cw, h);
+    FillRect(m, &r, gBorder);
+    for (b = CB_PIN; b <= CB_CLOSE; b++)
+        DrawCapButton(m, &L.btn[b], b);
+    if (L.showIcon && gIconSm)
+        DrawIconEx(m, L.icon.left, L.icon.top, gIconSm, L.icon.right - L.icon.left,
+                   L.icon.bottom - L.icon.top, 0, NULL, DI_NORMAL);
+    n = GetWindowTextW(hwnd, t, TITLE_MAX + 16);
+    if (n > 0 && L.text.right > L.text.left) {
+        /* タイトルは入りきれば全部、足りなければ「…」で省略、TITLE_MIN_W 未満なら隠す */
+        SIZE sz;
+        int avail = L.text.right - L.text.left;
+        HGDIOBJ of = SelectObject(m, gCapFont ? (HGDIOBJ)gCapFont : GetStockObject(DEFAULT_GUI_FONT));
+        GetTextExtentPoint32W(m, t, n, &sz);
+        if (sz.cx <= avail || avail >= Sc(TITLE_MIN_W)) {
+            SetBkMode(m, TRANSPARENT);
+            /* 非アクティブ時は Windows と同じように暗くする (ボタンのグリフと同じ割合) */
+            SetTextColor(m, gActive ? COL_FG : Blend(COL_FG, COL_TITLE, INACTIVE_ALPHA));
+            DrawTextW(m, t, n, &L.text,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+        SelectObject(m, of);
+    }
+    BitBlt(dc, 0, 0, cw, h, m, 0, 0, SRCCOPY);
     SelectObject(m, ob);
     DeleteObject(bmp);
-    DeleteObject(bg);
     DeleteDC(m);
 }
 
-static LRESULT CALLBACK PinProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
+/* ---- ツールチップ (ピン・最小化・最大化・閉じる) ---- */
+static void TipSetText(int id, const wchar_t *s)
 {
-    switch (msg) {
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        RECT rc;
-        HDC dc = BeginPaint(hw, &ps);
-        GetClientRect(hw, &rc);
-        DrawPin(dc, rc.right, rc.bottom);
-        EndPaint(hw, &ps);
-        return 0;
-    }
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;
-    case WM_MOUSEMOVE:
-        if (!gPinHot) {
-            TRACKMOUSEEVENT t;
-            t.cbSize = sizeof(t); t.dwFlags = TME_LEAVE; t.hwndTrack = hw; t.dwHoverTime = 0;
-            TrackMouseEvent(&t);
-            gPinHot = 1;
-            InvalidateRect(hw, NULL, FALSE);
-        }
-        break;
-    case WM_MOUSELEAVE:
-        gPinHot = 0;
-        InvalidateRect(hw, NULL, FALSE);
-        return 0;
-    case WM_LBUTTONUP:
-        /* 自分自身を作り直すので、処理はメインウィンドウ側で行う */
-        PostMessageW(gMain, WM_APP_TOPMOST, 0, 0);
-        return 0;
-    case WM_SETCURSOR:
-        SetCursor(LoadCursor(NULL, IDC_HAND));
-        return TRUE;
-    }
-    return DefWindowProcW(hw, msg, wp, lp);
+    TOOLINFOW ti;
+    if (!gTip || !gMain) return;
+    ZeroMemory(&ti, sizeof(ti));
+    ti.cbSize = TTTOOLINFOW_V2_SIZE;   /* comctl32 v5 (マニフェスト無し) でも通るサイズ */
+    ti.hwnd = gMain;
+    ti.uId = (UINT_PTR)id;
+    ti.lpszText = (LPWSTR)s;
+    SendMessageW(gTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
 }
 
-static void CreatePin(HWND owner)
+static void UpdateTips(void)
 {
-    WNDCLASSW pc = {0};
-    static int registered = 0;
-    pc.lpfnWndProc   = PinProc;
-    pc.hInstance     = GetModuleHandleW(NULL);
-    pc.hCursor       = LoadCursor(NULL, IDC_HAND);
-    pc.lpszClassName = L"StickyPinV1";
-    if (!registered) {
-        INITCOMMONCONTROLSEX ic;
-        RegisterClassW(&pc);
-        ic.dwSize = sizeof(ic);
-        ic.dwICC = ICC_WIN95_CLASSES;
-        InitCommonControlsEx(&ic);
-        registered = 1;
-    }
-    gPinHot = 0;
-    gPin = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"StickyPinV1", L"",
-                           WS_POPUP, 0, 0, 26, 26, owner, NULL, pc.hInstance, NULL);
-    if (!gPin) return;
-    /* ツールチップはピンの所有ウィンドウ (ピンと一緒に破棄される) */
-    gPinTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
-                              WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-                              CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-                              gPin, NULL, pc.hInstance, NULL);
-    if (gPinTip) {
+    TipSetText(CB_PIN, gTopmost ? L"最前面に表示: オン（クリックで解除）"
+                                : L"最前面に表示: オフ（クリックで常に手前に表示）");
+    TipSetText(CB_MAX, (gMain && IsZoomed(gMain)) ? L"元に戻す (縮小)" : L"最大化");
+}
+
+static void UpdateTipRects(HWND hwnd)
+{
+    RECT rc;
+    CapLayout L;
+    int b;
+    if (!gTip) return;
+    GetClientRect(hwnd, &rc);
+    CalcCaption(rc.right, &L);
+    for (b = CB_PIN; b <= CB_CLOSE; b++) {
         TOOLINFOW ti;
         ZeroMemory(&ti, sizeof(ti));
-        ti.cbSize = sizeof(ti);
-        ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-        ti.hwnd = gPin;
-        ti.uId = (UINT_PTR)gPin;
-        ti.lpszText = L"";
-        SendMessageW(gPinTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
-        PinTipText();
+        ti.cbSize = TTTOOLINFOW_V2_SIZE;
+        ti.hwnd = hwnd;
+        ti.uId = (UINT_PTR)b;
+        ti.rect = L.btn[b];
+        SendMessageW(gTip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
     }
+}
+
+static void CreateTips(HWND hwnd)
+{
+    static const wchar_t *text[5] = { L"", L"", L"最小化", L"最大化", L"閉じる" };
+    INITCOMMONCONTROLSEX ic;
+    RECT rc;
+    CapLayout L;
+    int b;
+    ic.dwSize = sizeof(ic);
+    ic.dwICC = ICC_WIN95_CLASSES;
+    InitCommonControlsEx(&ic);
+    gTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+                           WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                           CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                           hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    if (!gTip) return;
+    GetClientRect(hwnd, &rc);
+    CalcCaption(rc.right, &L);
+    for (b = CB_PIN; b <= CB_CLOSE; b++) {
+        TOOLINFOW ti;
+        ZeroMemory(&ti, sizeof(ti));
+        ti.cbSize = TTTOOLINFOW_V2_SIZE;
+        ti.uFlags = TTF_SUBCLASS;     /* ピン (クライアント領域) のマウス移動は自動で中継 */
+        ti.hwnd = hwnd;
+        ti.uId = (UINT_PTR)b;
+        ti.rect = L.btn[b];
+        ti.lpszText = (LPWSTR)text[b];
+        SendMessageW(gTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    }
+    UpdateTips();
+}
+
+/* 最小化/最大化/閉じる は非クライアント扱い (WM_NCMOUSEMOVE) なので、自分で中継する */
+static void RelayTipNC(HWND hwnd, LPARAM lp)
+{
+    MSG mm;
+    POINT pt;
+    if (!gTip) return;
+    pt.x = (short)LOWORD(lp); pt.y = (short)HIWORD(lp);
+    mm.hwnd = hwnd;
+    mm.message = WM_MOUSEMOVE;
+    mm.wParam = 0;
+    mm.pt = pt;
+    mm.time = (DWORD)GetMessageTime();
+    ScreenToClient(hwnd, &pt);
+    mm.lParam = MAKELPARAM(pt.x, pt.y);
+    SendMessageW(gTip, TTM_RELAYEVENT, 0, (LPARAM)&mm);
+}
+
+static int HitToButton(WPARAM ht)
+{
+    switch (ht) {
+    case HTMINBUTTON: return CB_MIN;
+    case HTMAXBUTTON: return CB_MAX;
+    case HTCLOSE:     return CB_CLOSE;
+    }
+    return CB_NONE;
+}
+
+static void TrackLeave(HWND hwnd, int nc)
+{
+    TRACKMOUSEEVENT t;
+    t.cbSize = sizeof(t);
+    t.dwFlags = TME_LEAVE | (nc ? TME_NONCLIENT : 0);
+    t.hwndTrack = hwnd;
+    t.dwHoverTime = 0;
+    if (TrackMouseEvent(&t)) {
+        if (nc) gTrackNC = 1; else gTrackC = 1;
+    }
+}
+
+static void DoCapButton(HWND hwnd, int b)
+{
+    switch (b) {
+    case CB_PIN:   SetTopmost(!gTopmost, 1); break;
+    case CB_MIN:   SendMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0); break;
+    case CB_MAX:   SendMessageW(hwnd, WM_SYSCOMMAND, IsZoomed(hwnd) ? SC_RESTORE : SC_MAXIMIZE, 0); break;
+    case CB_CLOSE: SendMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0); break;
+    }
+}
+
+/* タイトルの右クリック用のシステムメニュー。DefWindowProc の WM_CONTEXTMENU は内部の
+   当たり判定 (自前キャプションは「クライアント」扱い) を使うので、自分で出す */
+static void ShowSystemMenu(HWND hwnd, int x, int y)
+{
+    HMENU sm = GetSystemMenu(hwnd, FALSE);
+    int zoomed = IsZoomed(hwnd), cmd;
+    if (!sm) return;
+    EnableMenuItem(sm, SC_RESTORE,  MF_BYCOMMAND | (zoomed ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(sm, SC_MOVE,     MF_BYCOMMAND | (zoomed ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(sm, SC_SIZE,     MF_BYCOMMAND | (zoomed ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(sm, SC_MINIMIZE, MF_BYCOMMAND | MF_ENABLED);
+    EnableMenuItem(sm, SC_MAXIMIZE, MF_BYCOMMAND | (zoomed ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(sm, SC_CLOSE,    MF_BYCOMMAND | MF_ENABLED);
+    SetMenuDefaultItem(sm, SC_CLOSE, FALSE);
+    cmd = (int)TrackPopupMenu(sm, TPM_RETURNCMD | TPM_RIGHTBUTTON |
+                              (GetSystemMetrics(SM_MENUDROPALIGNMENT) ? TPM_RIGHTALIGN : TPM_LEFTALIGN),
+                              x, y, 0, hwnd, NULL);
+    if (cmd) PostMessageW(hwnd, WM_SYSCOMMAND, (WPARAM)cmd, MAKELPARAM(x, y));
 }
 
 static void SetTopmost(int on, int save)
 {
     gTopmost = on ? 1 : 0;
-    if (gMain) {
-        /* ピン (所有ウィンドウ) がある状態で切り替えると、環境によって (Wine で確認)
-           オーナーの最前面属性が変わらないことがあるため、ピンを作り直す。
-           新しいピンはオーナーの最前面状態を引き継いで、その直上に作られる。 */
-        int hadPin = (gPin != NULL);
-        int wasActive = (GetForegroundWindow() == gMain);
-        HWND focus = GetFocus();
-        if (hadPin) { DestroyWindow(gPin); gPin = NULL; gPinTip = NULL; }
+    /* 変更(v1.2): ピンは自前のキャプション内のボタンになったので、別ウィンドウの作り直しは不要 */
+    if (gMain)
         SetWindowPos(gMain, gTopmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        if (hadPin) CreatePin(gMain);
-        /* 作り直しで入力先が外れないようにする (アクティブだったときだけ戻す) */
-        if (wasActive && GetForegroundWindow() != gMain) SetForegroundWindow(gMain);
-        if (wasActive && focus && IsWindow(focus) && GetFocus() != focus) SetFocus(focus);
-    }
     if (save) {
         wchar_t sec[16];
         wsprintfW(sec, L"%d", gSlot);
         IniWriteInt(sec, L"topmost", gTopmost);
     }
-    PinTipText();
-    PositionPin();
-    if (gPin) InvalidateRect(gPin, NULL, FALSE);
+    UpdateTips();
+    InvalidateCaption(gMain);
+}
+
+/* ---- 追加(v1.2): スクロールの手がかり ----
+   上にまだ文字がある (先頭が見えていない) → 枠の上辺、下にまだある → 枠の下辺を少し明るくする。
+   表示座標 (EM_POSFROMCHAR) だけで判定するので、表示倍率 (EM_SETZOOM) にも左右されない。 */
+static void InvalidateHintBands(void)
+{
+    RECT rc, r;
+    if (!gMain) return;
+    GetClientRect(gMain, &rc);
+    SetRect(&r, 0, gCapH, rc.right, gCapH + BORDER);
+    InvalidateRect(gMain, &r, FALSE);
+    SetRect(&r, 0, rc.bottom - BORDER, rc.right, rc.bottom);
+    InvalidateRect(gMain, &r, FALSE);
+}
+
+static void UpdateScrollHint(void)
+{
+    RECT fr, cr;
+    POINTL p0, pl, pp;
+    LONG lines, li;
+    int lh = 0, up, down, bottom;
+    if (!gEdit || !gMain) return;
+    SendMessageW(gEdit, EM_GETRECT, 0, (LPARAM)&fr);
+    GetClientRect(gEdit, &cr);
+    bottom = (fr.bottom < cr.bottom) ? fr.bottom : cr.bottom;
+    p0.x = p0.y = 0;
+    SendMessageW(gEdit, EM_POSFROMCHAR, (WPARAM)&p0, 0);
+    up = (p0.y < fr.top);
+    lines = (LONG)SendMessageW(gEdit, EM_GETLINECOUNT, 0, 0);
+    if (lines < 1) lines = 1;
+    li = (LONG)SendMessageW(gEdit, EM_LINEINDEX, (WPARAM)(lines - 1), 0);
+    pl.x = pl.y = 0;
+    SendMessageW(gEdit, EM_POSFROMCHAR, (WPARAM)&pl, li);
+    if (lines >= 2) {
+        li = (LONG)SendMessageW(gEdit, EM_LINEINDEX, (WPARAM)(lines - 2), 0);
+        pp.x = pp.y = 0;
+        SendMessageW(gEdit, EM_POSFROMCHAR, (WPARAM)&pp, li);
+        lh = pl.y - pp.y;
+    }
+    if (lh <= 0) lh = MulDiv(gLineH, gZoom, 100);
+    down = (pl.y + lh > bottom + 1);
+    if (up != gHintUp || down != gHintDown) {
+        gHintUp = up;
+        gHintDown = down;
+        InvalidateHintBands();
+    }
+}
+
+static void PostHint(void)
+{
+    if (!gMain || gHintPosted) return;
+    gHintPosted = 1;
+    PostMessageW(gMain, WM_APP_HINT, 0, 0);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -928,7 +1384,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ES_WANTRETURN | ES_NOHIDESEL | WS_CLIPSIBLINGS,
             0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_EDIT, NULL, NULL);
         SendMessageW(gEdit, EM_SETBKGNDCOLOR, 0, COL_BG);
-        SendMessageW(gEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE);
+        /* 変更(v1.2): ENM_UPDATE / ENM_SCROLL はスクロールの手がかりの更新用 */
+        SendMessageW(gEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_UPDATE | ENM_SCROLL);
         RecreateFont();
         /* 修正: リッチエディットの既定上限は約32K文字。長いメモが入力不能になるのを防ぐ */
         SendMessageW(gEdit, EM_EXLIMITTEXT, 0, 0x7FFFFFFF);
@@ -965,6 +1422,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         LoadNote();
         if (gZoom != 100) ApplyZoom();   /* 追加(v1.1): INI の zoom= を反映 (表示のみ) */
         ColorCaption(hwnd);
+        CreateCaptionFonts(hwnd);   /* 追加(v1.2) */
+        gIconSm = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APP),
+                                    IMAGE_ICON, Sc(CAP_ICON_PX), Sc(CAP_ICON_PX), 0);
 #ifdef TEST_HARNESS
         SetTimer(hwnd, 99, 1500, NULL);
 #endif
@@ -974,17 +1434,170 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) {
+            gHot = CB_NONE;
+            return 0;
+        }
         Layout(hwnd);
         HideEditBar();
-        PositionPin();
+        UpdateTips();
+        PostHint();
         return 0;
-    case WM_MOVE:
-        PositionPin();
+
+    /* ---- 追加(v1.2): 自前のキャプション ---- */
+    case WM_NCCALCSIZE: {
+        /* 標準の計算 (左右下のリサイズ枠) を使い、上だけキャプション分を取り消す */
+        RECT *r = wp ? &((NCCALCSIZE_PARAMS *)lp)->rgrc[0] : (RECT *)lp;
+        RECT orig = *r;
+        LRESULT res = DefWindowProcW(hwnd, msg, wp, lp);
+        int top = r->top - orig.top, side = r->left - orig.left;
+        if (IsZoomed(hwnd)) {
+            /* 最大化時はウィンドウが枠の分だけ画面外にはみ出すので、その分は下げる */
+            if (top - side >= 8 && top - side < 200) gCapH = top - side;
+            r->top = orig.top + side;
+        } else {
+            if (!IsIconic(hwnd) && top >= 8 && top < 200) gCapH = top;
+            r->top = orig.top;
+        }
+        return res;
+    }
+    case WM_NCHITTEST: {
+        LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);   /* 左右下の枠はそのまま */
+        POINT pt;
+        if (hit != HTCLIENT) return hit;
+        pt.x = (short)LOWORD(lp); pt.y = (short)HIWORD(lp);
+        ScreenToClient(hwnd, &pt);
+        return CaptionHitTest(hwnd, pt);
+    }
+    case WM_NCACTIVATE:
+        gActive = wp ? 1 : 0;
+        InvalidateCaption(hwnd);
+        /* lParam = -1: 標準のキャプションを描かせない */
+        return DefWindowProcW(hwnd, msg, wp, (LPARAM)-1);
+    case WM_SETTEXT: {
+        LRESULT r = DefWindowProcW(hwnd, msg, wp, lp);
+        InvalidateCaption(hwnd);
+        return r;
+    }
+    case WM_NCMOUSEMOVE: {
+        int b = HitToButton(wp);
+        if (!gTrackNC) TrackLeave(hwnd, 1);
+        RelayTipNC(hwnd, lp);
+        if (!gPressed) SetHot(hwnd, b);
+        if (b) return 0;   /* ボタンの上は DefWindowProc に渡さない (標準ボタンを描かせない) */
         break;
-    case WM_WINDOWPOSCHANGED:
-        /* 追加(v1.1): 重なり順が変わったときもピンをオーナーの直上に保つ */
-        if (!(((WINDOWPOS *)lp)->flags & SWP_NOZORDER)) PositionPin();
+    }
+    case WM_NCMOUSELEAVE:
+        gTrackNC = 0;
+        if (!gPressed && gHot >= CB_MIN) SetHot(hwnd, CB_NONE);
+        return 0;
+    case WM_NCLBUTTONDOWN:
+    case WM_NCLBUTTONDBLCLK: {
+        int b = HitToButton(wp);
+        if (!b) break;     /* タイトル (移動/ダブルクリックで最大化)・枠・アイコンは標準の処理 */
+        if (gTip) SendMessageW(gTip, TTM_POP, 0, 0);
+        gPressed = b;
+        gHot = b;
+        SetCapture(hwnd);
+        InvalidateCaption(hwnd);
+        return 0;
+    }
+    case WM_NCLBUTTONUP:
+        if (HitToButton(wp)) return 0;
         break;
+    case WM_MOUSEMOVE: {
+        POINT pt;
+        int b;
+        pt.x = (short)LOWORD(lp); pt.y = (short)HIWORD(lp);
+        b = CapButtonAt(hwnd, pt);
+        if (gPressed) {    /* 押したまま動かしている: 押したボタンの上にいる間だけ押下表示 */
+            SetHot(hwnd, b == gPressed ? b : CB_NONE);
+            return 0;
+        }
+        if (b != CB_PIN) b = CB_NONE;
+        if (b && !gTrackC) TrackLeave(hwnd, 0);
+        SetHot(hwnd, b);
+        break;
+    }
+    case WM_MOUSELEAVE:
+        gTrackC = 0;
+        if (!gPressed && gHot == CB_PIN) SetHot(hwnd, CB_NONE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        POINT pt;
+        pt.x = (short)LOWORD(lp); pt.y = (short)HIWORD(lp);
+        if (CapButtonAt(hwnd, pt) == CB_PIN) {
+            gPressed = CB_PIN;
+            gHot = CB_PIN;
+            SetCapture(hwnd);
+            InvalidateCaption(hwnd);
+            return 0;
+        }
+        break;
+    }
+    case WM_LBUTTONUP:
+        if (gPressed) {
+            POINT pt;
+            int b = gPressed, at;
+            pt.x = (short)LOWORD(lp); pt.y = (short)HIWORD(lp);
+            at = CapButtonAt(hwnd, pt);
+            gPressed = CB_NONE;
+            ReleaseCapture();
+            gTrackNC = gTrackC = 0;
+            gHot = (at == b) ? b : CB_NONE;
+            if (gHot) TrackLeave(hwnd, gHot != CB_PIN);
+            InvalidateCaption(hwnd);
+            if (at == b) DoCapButton(hwnd, b);
+            return 0;
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        if (gPressed) {
+            gPressed = CB_NONE;
+            SetHot(hwnd, CB_NONE);
+            InvalidateCaption(hwnd);
+        }
+        break;
+    case WM_SETCURSOR:
+        if ((HWND)wp == hwnd && LOWORD(lp) == HTCLIENT) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            if (CapButtonAt(hwnd, pt) == CB_PIN) {   /* ピンは v1.1 と同じく手の形 */
+                SetCursor(LoadCursor(NULL, IDC_HAND));
+                return TRUE;
+            }
+        }
+        break;
+    case WM_NCRBUTTONDOWN:
+        if (wp == HTCAPTION || wp == HTSYSMENU || HitToButton(wp)) return 0;
+        break;
+    case WM_NCRBUTTONUP:
+        if (wp == HTCAPTION || wp == HTSYSMENU || HitToButton(wp)) {
+            ShowSystemMenu(hwnd, (short)LOWORD(lp), (short)HIWORD(lp));
+            return 0;
+        }
+        break;
+    case WM_CONTEXTMENU:
+        /* タイトル・アイコン・キャプションボタンの右クリック → システムメニュー */
+        if ((HWND)wp == hwnd && lp != (LPARAM)-1) {
+            LRESULT ht = SendMessageW(hwnd, WM_NCHITTEST, 0, lp);
+            if (ht == HTCAPTION || ht == HTSYSMENU || HitToButton((WPARAM)ht)) {
+                ShowSystemMenu(hwnd, (short)LOWORD(lp), (short)HIWORD(lp));
+                return 0;
+            }
+        }
+        break;
+    case WM_SETFOCUS:
+        /* 追加(v1.2): ウィンドウがアクティブになったら入力先をメモ本文へ */
+        if (gEdit) SetFocus(gEdit);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;          /* WM_PAINT で全部描く (ちらつき防止) */
+    case WM_APP_HINT:
+        gHintPosted = 0;
+        UpdateScrollHint();
+        return 0;
     case WM_MOUSEWHEEL:
         WheelScroll(wp);
         return 0;
@@ -992,16 +1605,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
         RECT rc, band;
+        int i;
         GetClientRect(hwnd, &rc);
-        FillRect(dc, &rc, gBg);
-        band = rc; band.right = BORDER;
+        /* 変更(v1.2): 上端 gCapH はキャプション。その下は従来どおり 赤い枠 BORDER + 緑の面 */
+        if (ps.rcPaint.top < gCapH) PaintCaption(hwnd, dc, rc.right);
+        band = rc; band.top = gCapH; band.right = BORDER;
         FillRect(dc, &band, gBorder);
-        band = rc; band.left = rc.right - BORDER;
+        band = rc; band.top = gCapH; band.left = rc.right - BORDER;
         FillRect(dc, &band, gBorder);
-        band = rc; band.bottom = BORDER;
+        band = rc; band.top = gCapH; band.bottom = gCapH + BORDER;
         FillRect(dc, &band, gBorder);
         band = rc; band.top = rc.bottom - BORDER;
         FillRect(dc, &band, gBorder);
+        SetRect(&band, BORDER, gCapH + BORDER, rc.right - BORDER, rc.bottom - BORDER);
+        FillRect(dc, &band, gBg);
+        /* 追加(v1.2): スクロールの手がかり。緑の面に接する側ほど明るいグラデーション (HINT_PX 行) */
+        for (i = 0; i < HINT_PX && (gHintUp || gHintDown); i++) {
+            HBRUSH hb = CreateSolidBrush(Blend(COL_HINT, COL_TITLE, 255 * (HINT_PX - i) / HINT_PX));
+            if (gHintUp) {
+                SetRect(&band, BORDER, gCapH + BORDER - 1 - i, rc.right - BORDER, gCapH + BORDER - i);
+                FillRect(dc, &band, hb);
+            }
+            if (gHintDown) {
+                SetRect(&band, BORDER, rc.bottom - BORDER + i, rc.right - BORDER, rc.bottom - BORDER + i + 1);
+                FillRect(dc, &band, hb);
+            }
+            DeleteObject(hb);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1049,9 +1679,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetDirty(1);
             HideEditBar();
             TouchIdle();
+            PostHint();
+        } else if (LOWORD(wp) == ID_EDIT &&
+                   (HIWORD(wp) == EN_VSCROLL || HIWORD(wp) == EN_UPDATE)) {
+            PostHint();
         }
         return 0;
     case WM_NOTIFY:
+        if (((NMHDR *)lp)->idFrom == ID_EDIT && ((NMHDR *)lp)->code == EN_SELCHANGE)
+            PostHint();   /* 追加(v1.2): カーソル移動で自動スクロールしたとき */
         if (gReady &&
             ((NMHDR *)lp)->idFrom == ID_EDIT &&
             ((NMHDR *)lp)->code == EN_SELCHANGE)
@@ -1067,7 +1703,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_GETMINMAXINFO: {
         MINMAXINFO *m = (MINMAXINFO *)lp;
-        m->ptMinTrackSize.x = 300;  /* 変更: 7色分の幅を確保 */
+        /* 変更(v1.2): 300 固定 → 色ボタンを間隔 0 まで詰めた幅 (と キャプションボタン+ピン) */
+        int need = INK_COUNT * SWATCH_BOX + BORDER * 2 + SWATCH_MARGIN * 2;
+        int cap = Sc(CAPBTN_W) * 4 + Sc(CAP_PAD);
+        int nc = 16;
+        RECT wr, cr;
+        if (!IsIconic(hwnd) && GetWindowRect(hwnd, &wr) && GetClientRect(hwnd, &cr) && cr.right > 0) {
+            nc = (wr.right - wr.left) - cr.right;
+            if (nc < 0 || nc > 64) nc = 16;
+        }
+        m->ptMinTrackSize.x = (need > cap ? need : cap) + nc;
         m->ptMinTrackSize.y = 160;
         return 0;
     }
@@ -1079,15 +1724,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     case WM_ACTIVATE:
         ColorCaption(hwnd);
-        PositionPin();
-        PostMessageW(hwnd, WM_APP_PIN, 0, 0);  /* 追加(v1.1): 重なり順の確定後にもう一度 */
         break;
-    case WM_APP_PIN:
-        PositionPin();
-        return 0;
-    case WM_APP_TOPMOST:
-        SetTopmost(!gTopmost, 1);
-        return 0;
     case WM_CLOSE:
         SavePlacement(hwnd);
         TakeTitleLine();   /* 追加: '#タイトル' 行 → INI に保存し本文から削除 */
@@ -1098,6 +1735,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (gFont) DeleteObject(gFont);
         if (gBg) DeleteObject(gBg);
         if (gBorder) DeleteObject(gBorder);
+        if (gCapFont) DeleteObject(gCapFont);
+        if (gGlyphFont) DeleteObject(gGlyphFont);
+        if (gPinFont) DeleteObject(gPinFont);
+        if (gIconSm) DestroyIcon(gIconSm);
         if (gMutex) { CloseHandle(gMutex); gMutex = NULL; }
         PostQuitMessage(0);
         return 0;
@@ -1146,14 +1787,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     gMain = CreateWindowExW(
         0,
         L"StickyBB", gUserTitle[0] ? gUserTitle : gTitle,
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         x, y, w, h, NULL, NULL, inst, NULL);
-    /* 追加(v1.1): 最前面ピン (メインウィンドウの作成が終わってから作る) */
-    CreatePin(gMain);
+    /* 追加(v1.2): キャプションボタンのツールチップ (ピンは自前キャプション内のボタン) */
+    CreateTips(gMain);
+    SetWindowPos(gMain, NULL, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     RestorePlacement(gMain);
     ShowWindow(gMain, SW_SHOW);
     if (gTopmost) SetTopmost(1, 0);   /* 追加(v1.1) */
-    PositionPin();
+    PostHint();
 
     ACCEL acc = { FVIRTKEY | FCONTROL, 'S', ID_SAVE };
     HACCEL hAcc = CreateAcceleratorTableW(&acc, 1);
