@@ -1,0 +1,17 @@
+# build outputs
+*.exe
+*.o
+*.obj
+*.res
+*.res.o
+build/
+dist/
+*.zip
+# user data created next to the exe (never commit real notes/settings)
+*.rtf
+*.rtf.tmp
+StickyBB.ini
+# misc
+.DS_Store
+Thumbs.db
+.env

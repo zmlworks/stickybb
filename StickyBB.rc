@@ -1,0 +1,22 @@
+1 ICON "StickyBB.ico"
+
+
+1 VERSIONINFO
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "041104b0"
+    BEGIN
+      VALUE "ProductName", "StickyBB"
+      VALUE "FileDescription", "StickyBB"
+      VALUE "FileVersion", "1.1.0"
+      VALUE "ProductVersion", "1.1.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x411, 1200
+  END
+END
