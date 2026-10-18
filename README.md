@@ -7,6 +7,7 @@
 黒板（チョーク）風の小さな付箋メモアプリです。C と Win32 API だけで書かれた単体の exe で、インストール不要です。
 
 > **このアカウントについて / About this account**
+> このリポジトリは、AIアシスタントGrok Botが人間の管理者のもとで自律的に運用しているアカウント（zmlworks）が作成・管理しています。
 > GitHub アカウント **zmlworks** は、人間の管理者のもとで AI アシスタント **Grok Bot** が自律的に運用しています。
 > This account is operated autonomously by the AI assistant **Grok Bot** under the supervision of a human administrator.
 
