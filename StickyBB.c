@@ -45,6 +45,9 @@
 #define COL_FG     RGB(0xD3, 0xD3, 0xD3)
 #define COL_TITLE  RGB(0x3D, 0x01, 0x05)
 #define COL_PIN_HOT RGB(0x5A, 0x16, 0x1C)   /* 追加(v1.1): ピンのオン背景 */
+#define COL_DIRTY  RGB(0x00, 0xA2, 0xE8)   /* 追加(v1.2.1): 未保存マーク「* 」の色 (CEditor の未保存ドットと同じ青) */
+#define DIRTY_MARK     L"* "               /* 変更(v1.2.1): 「● 」→「* 」 */
+#define DIRTY_MARK_LEN 2
 
 /* ---- 追加(v1.2): 自前で描くタイトルバー ----
    Win11 の標準キャプション (DWM が描く) と同じ見た目・動作を、ボタン幅だけ狭くして再現する。
@@ -158,12 +161,13 @@ static void IniPath(void)
 }
 
 /* 追加: 未保存マーク付きでウィンドウタイトル(=タスクバー名)を更新。
-   タイトル文字列の先頭に「● 」を付ける (v1.2: キャプションは自前で描くが、文字列は同じものを使う) */
+   タイトル文字列の先頭に「* 」を付ける (v1.2: キャプションは自前で描くが、文字列は同じものを使う)
+   変更(v1.2.1): マークを「● 」から「* 」に。自前のキャプションでは「* 」だけ青 (COL_DIRTY) で描く */
 static void UpdateTitle(void)
 {
     wchar_t buf[TITLE_MAX + 8];
     if (!gMain) return;
-    lstrcpyW(buf, gDirty ? L"\x25CF " : L"");
+    lstrcpyW(buf, gDirty ? DIRTY_MARK : L"");
     lstrcatW(buf, gUserTitle[0] ? gUserTitle : gTitle);
     SetWindowTextW(gMain, buf);   /* WM_SETTEXT でキャプションを描き直す */
 }
@@ -175,11 +179,23 @@ static void SetDirty(int d)
     UpdateTitle();
 }
 
+/* 変更(v1.2.1): タイトルは INI に "..." で囲んで書く (TakeTitleLine)。GetPrivateProfileString は
+   値を囲む引用符を 1 組取り除くので、タイトル自体が " で始まって " で終わっても元どおりに読める。
+   囲みの分だけ大きめのバッファで読み、TITLE_MAX 文字に切る (サロゲートペアの途中では切らない)。
+   v1.2.0 以前の引用符なしの値もそのまま読める。 */
 static void LoadUserTitle(void)
 {
-    wchar_t sec[16];
+    wchar_t sec[16], buf[TITLE_MAX * 2 + 8];
+    int n;
     wsprintfW(sec, L"%d", gSlot);
-    GetPrivateProfileStringW(sec, L"title", L"", gUserTitle, TITLE_MAX + 1, gIni);
+    GetPrivateProfileStringW(sec, L"title", L"", buf, (DWORD)(sizeof(buf) / sizeof(buf[0])), gIni);
+    n = lstrlenW(buf);
+    if (n > TITLE_MAX) {
+        n = TITLE_MAX;
+        if (buf[n - 1] >= 0xD800 && buf[n - 1] <= 0xDBFF) n--;
+    }
+    buf[n] = 0;
+    lstrcpyW(gUserTitle, buf);
 }
 
 static void IniWriteInt(const wchar_t *sec, const wchar_t *key, int v)
@@ -505,17 +521,34 @@ static void LoadNote(void)
     SetDirty(0);
 }
 
-/* 追加: 文書の先頭文字が '#' なら、その1段落目をタイトルとして取り出して削除する。
+/* 追加: 文書の先頭文字が '#' なら、その1行目をタイトルとして取り出して削除する。
    - 判定は「文書の一番最初の文字」のみ (前の空白は無視しない: 予測しやすさ優先)
    - 削除は EM_REPLACESEL で該当範囲だけ消すので、残りの文字の色/書式はそのまま
    - '#' だけなら既定タイトルに戻す
-   - 戻り値: 処理したら 1 (呼び出し側で保存する) */
+   - 戻り値: 処理したら 1 (呼び出し側で保存する)
+   変更(v1.2.1):
+   - タイトル行の終わりは EM_FINDTEXTEXW(L"\r") ではなく、先頭を EM_GETTEXTRANGE で読んで
+     最初の \r / \n / \v (0x0B, Shift+Enter の行区切り) / U+2028 / U+2029 を探す。
+     旧版は \r が見つからないと文書全体を消していた。また Shift+Enter の行区切りは \r ではないため、
+     その次の行まで「1段落目」として一緒に消えていた。
+   - 消すのは [0, 行区切り+1) だけ (\r\n の組なら \n まで)。区切りが無く文書全体が1行なら全部
+     (= タイトル行だけ)。それ以外 (先頭が長すぎて区切りが見つからない・長さが合わない) は消さずに
+     タイトルだけ設定する。タイトル行より後ろは決して消さない。
+   - タイトルに使える文字: 制御文字以外はすべて (* ? : " / \ < > | も可)。タイトルはファイル名には使わない。
+     INI には "..." で囲んで書く (LoadUserTitle 参照)。 */
+#define TITLE_SCAN 2048   /* タイトル行を探す範囲 (文字数)。これより長い1行目は消さない */
+static int IsLineBreak(wchar_t c)
+{
+    return c == L'\r' || c == L'\n' || c == 0x0B || c == 0x2028 || c == 0x2029;
+}
+
 static int TakeTitleLine(void)
 {
-    wchar_t line[512], clean[TITLE_MAX + 1];
+    static wchar_t line[TITLE_SCAN + 2];
+    wchar_t clean[TITLE_MAX + 1], quoted[TITLE_MAX + 3];
     TEXTRANGEW tr;
-    FINDTEXTEXW ft;
-    LONG end, cut, n, i, j;
+    GETTEXTLENGTHEX gl;
+    LONG total, n, got, brk, cut, i, j;
     CHARRANGE save, del;
     wchar_t sec[16];
 
@@ -525,36 +558,55 @@ static int TakeTitleLine(void)
     SendMessageW(gEdit, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
     if (line[0] != L'#') return 0;
 
-    /* 1段落目の終わり (RichEdit の段落区切りは \r) */
-    ft.chrg.cpMin = 0; ft.chrg.cpMax = -1; ft.lpstrText = L"\r";
-    end = (LONG)SendMessageW(gEdit, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&ft);
-    if (end < 0) { end = GetWindowTextLengthW(gEdit); cut = end; }
-    else cut = end + 1;                         /* 改行ごと消す */
-    n = end; if (n > 511) n = 511;
-    tr.chrg.cpMin = 0; tr.chrg.cpMax = n;
-    SendMessageW(gEdit, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+    /* 文字位置 (cp) 単位の文書の長さ (段落区切り \r = 1 文字。GetWindowTextLength は CRLF で数えるので使わない) */
+    gl.flags = GTL_NUMCHARS | GTL_PRECISE; gl.codepage = 1200;
+    total = (LONG)SendMessageW(gEdit, EM_GETTEXTLENGTHEX, (WPARAM)&gl, 0);
 
-    /* '#' の後ろを整形: 制御文字・ファイル名に使えない文字を除去、前後の空白(全角含む)を除去、64文字まで */
-    for (i = 1, j = 0; line[i] && j < TITLE_MAX; i++) {
+    /* 先頭を読んで最初の行区切りを探す */
+    n = total; if (n > TITLE_SCAN) n = TITLE_SCAN;
+    tr.chrg.cpMin = 0; tr.chrg.cpMax = n; line[0] = 0;
+    got = (LONG)SendMessageW(gEdit, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+    if (got < 0) got = 0;
+    if (got > n) got = n;
+    line[got] = 0;
+    for (brk = 0; brk < got && !IsLineBreak(line[brk]); brk++) ;
+
+    cut = 0;   /* 0 = 消さない */
+    if (line[0] == L'#' && got == n && total >= 1) {
+        if (brk < got) {
+            cut = brk + 1;
+            if (line[brk] == L'\r' && brk + 1 < got && line[brk + 1] == L'\n') cut++;
+        } else if (got == total) {
+            cut = total;   /* 区切りなし & 文書全体が読めた = 文書はタイトル行だけ */
+        }
+        if (cut > total) cut = 0;   /* 念のため */
+    }
+
+    /* '#' の後ろを整形: 制御文字だけ除去 (印字できる文字はすべて可)、前後の空白(全角含む)を除去、64文字まで */
+    for (i = 1, j = 0; i < brk && j < TITLE_MAX; i++) {
         wchar_t c = line[i];
-        if (c < 0x20 || c == 0x7F || wcschr(L"\\/:*?\"<>|", c)) continue;
-        if (j == 0 && (c == L' ' || c == L'\t' || c == 0x3000)) continue;
+        if (c < 0x20 || (c >= 0x7F && c <= 0x9F) || c == 0xFFFC) continue;   /* C0/DEL/C1, 埋め込みオブジェクト */
+        if (j == 0 && (c == L' ' || c == 0x3000)) continue;
         clean[j++] = c;
     }
+    if (j > 0 && clean[j-1] >= 0xD800 && clean[j-1] <= 0xDBFF) j--;   /* サロゲートペアを途中で切らない */
     while (j > 0 && (clean[j-1] == L' ' || clean[j-1] == 0x3000)) j--;
     clean[j] = 0;
 
-    /* 先頭段落を削除 (選択位置はずらして復元) */
-    SendMessageW(gEdit, EM_EXGETSEL, 0, (LPARAM)&save);
-    del.cpMin = 0; del.cpMax = cut;
-    SendMessageW(gEdit, EM_EXSETSEL, 0, (LPARAM)&del);
-    SendMessageW(gEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
-    save.cpMin = (save.cpMin > cut) ? save.cpMin - cut : 0;
-    save.cpMax = (save.cpMax > cut) ? save.cpMax - cut : 0;
-    SendMessageW(gEdit, EM_EXSETSEL, 0, (LPARAM)&save);
+    /* タイトル行 [0, cut) だけを削除 (選択位置はずらして復元) */
+    if (cut > 0) {
+        SendMessageW(gEdit, EM_EXGETSEL, 0, (LPARAM)&save);
+        del.cpMin = 0; del.cpMax = cut;
+        SendMessageW(gEdit, EM_EXSETSEL, 0, (LPARAM)&del);
+        SendMessageW(gEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        save.cpMin = (save.cpMin > cut) ? save.cpMin - cut : 0;
+        save.cpMax = (save.cpMax > cut) ? save.cpMax - cut : 0;
+        SendMessageW(gEdit, EM_EXSETSEL, 0, (LPARAM)&save);
+    }
 
     wsprintfW(sec, L"%d", gSlot);
-    WritePrivateProfileStringW(sec, L"title", clean[0] ? clean : NULL, gIni);
+    quoted[0] = L'"'; lstrcpyW(quoted + 1, clean); lstrcatW(quoted, L"\"");
+    WritePrivateProfileStringW(sec, L"title", clean[0] ? quoted : NULL, gIni);
     lstrcpyW(gUserTitle, clean);
     SetDirty(1);
     UpdateTitle();
@@ -1151,6 +1203,21 @@ static void PaintCaption(HWND hwnd, HDC dc, int cw)
             SetBkMode(m, TRANSPARENT);
             /* 非アクティブ時は Windows と同じように暗くする (ボタンのグリフと同じ割合) */
             SetTextColor(m, gActive ? COL_FG : Blend(COL_FG, COL_TITLE, INACTIVE_ALPHA));
+            if (gDirty && n >= DIRTY_MARK_LEN && wcsncmp(t, DIRTY_MARK, DIRTY_MARK_LEN) == 0) {
+                /* 追加(v1.2.1): 未保存マーク「* 」だけ青で描き、続けて同じ位置からタイトルを描く */
+                RECT rt = L.text;
+                SIZE mk;
+                GetTextExtentPoint32W(m, t, DIRTY_MARK_LEN, &mk);
+                SetTextColor(m, COL_DIRTY);
+                DrawTextW(m, t, DIRTY_MARK_LEN, &rt,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                rt.left += mk.cx;
+                if (rt.left < rt.right && n > DIRTY_MARK_LEN) {
+                    SetTextColor(m, gActive ? COL_FG : Blend(COL_FG, COL_TITLE, INACTIVE_ALPHA));
+                    DrawTextW(m, t + DIRTY_MARK_LEN, n - DIRTY_MARK_LEN, &rt,
+                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                }
+            } else
             DrawTextW(m, t, n, &L.text,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
         }

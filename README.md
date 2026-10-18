@@ -17,8 +17,10 @@
   - 範囲を選択して色ボタンを押すと、その部分の色を変更
   - 10 分操作しないとインク色は先頭の色に戻ります
 - 自動保存: 30 分ごと・ウィンドウを閉じたとき・シャットダウン / サインアウト時。一時ファイルに書いてから置き換える安全な保存
-- 未保存マーク: 変更があるとタイトルの先頭に「● 」
+- 未保存マーク: 変更があるとタイトルの先頭に青い「* 」（#00A2E8。v1.2.1 で「● 」から変更）
 - タイトル設定: 本文の 1 文字目が `#` の行（例 `#買い物メモ`）は、閉じる・Ctrl+S・シャットダウン時にウィンドウタイトルになります（本文からは削除、INI に保存）
+  - タイトルには制御文字以外のすべての文字（`*` `?` `:` `"` `/` `\` `<` `>` `|` を含む）が使えます。前後の空白は除き、最大 64 文字です（v1.2.1）
+  - 本文から削除するのは 1 行目（最初の改行・Shift+Enter の行区切りまで）だけで、2 行目以降は消しません（v1.2.1）
 - **表示倍率（v1.1.0）**: ウィンドウごとに拡大 / 縮小。表示だけの倍率（EM_SETZOOM）なので、文字の色・書式や保存される RTF は変わりません
 - **最前面に表示（v1.1.0）**: タイトルバーのピンをクリックすると、そのウィンドウを常に手前に表示（オン = まっすぐな塗りつぶしのピン＋背景、オフ = 傾いたピンの輪郭）
 
@@ -67,7 +69,7 @@ Visual Studio の場合は `StickyBB.c` と `StickyBB.rc` をプロジェクト�
 ## English (short)
 
 StickyBB is a small chalkboard-style sticky-note app for Windows (single exe, plain C/Win32, RichEdit).
-Features: 7 chalk ink colours, safe auto-save (every 30 min, on close, on shutdown/sign-out), unsaved mark, `#title` first line sets the window title,
+Features: 7 chalk ink colours, safe auto-save (every 30 min, on close, on shutdown/sign-out), a blue `* ` unsaved mark, `#title` first line sets the window title (any printable characters, only that first line is removed),
 per-window zoom (Ctrl+; or Ctrl+= / Ctrl+- / Ctrl+0, display-only so colours and the saved RTF are unchanged),
 a per-window "always on top" pin toggle in the title bar,
 a custom-drawn Windows 11 style title bar with narrower (32 px) caption buttons, a layout that packs the colour buttons and hides the title on narrow windows,
