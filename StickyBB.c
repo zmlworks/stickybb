@@ -69,9 +69,10 @@
 #define CLOSE_PRESS_ALPHA 230 /* 閉じる 押下: #C42B1C を 90% */
 #define PRESS_GLYPH_ALPHA 200 /* 押下中のグリフは少し暗く */
 /* 追加(v1.2): スクロールの手がかり (枠の上下を少し明るく)
-   変更(v1.3): 目立つように #6A1A20 → 明るいチョークのような赤 #FF8C96。幅 (3px) と枠 (BORDER) は同じ */
+   変更(v1.3): 目立つように #6A1A20 → 明るいチョークのような赤 #FF8C96。幅 (3px) と枠 (BORDER) は同じ
+   変更(v1.3.1): 明るすぎたので v1.2.1 と v1.3.0 の中間 #B5535B に */
 #define HINT_PX         3
-#define COL_HINT        RGB(0xFF, 0x8C, 0x96)
+#define COL_HINT        RGB(0xB5, 0x53, 0x5B)
 static const int kHintAlpha[HINT_PX] = { 255, 200, 130 };   /* 緑の面に接する行から外へ (v1.2: 255,170,85) */
 #define WM_APP_HINT     (WM_APP + 3)
 
@@ -862,28 +863,84 @@ static LONG EditTopY(void)
     return p.y;
 }
 
+/* 修正(v1.3.1): 本文の最後の行の下端が、表示範囲の下端からあと何 px 下にあるか (UpdateScrollHint と同じ判定)。
+   0 以下 = もう下へはスクロールしない。ホイール/通常のスクロールと同じ所で止めるのに使う
+   (EM_SETSCROLLPOS は最後の行を通り越して、最後の行が上端に消えるところまで動かせてしまうため)。 */
+static int TextRoomBelow(void)
+{
+    RECT fr, cr;
+    POINTL pl, pp;
+    LONG lines, li;
+    int lh = 0, bottom;
+    SendMessageW(gEdit, EM_GETRECT, 0, (LPARAM)&fr);
+    GetClientRect(gEdit, &cr);
+    bottom = (fr.bottom < cr.bottom) ? fr.bottom : cr.bottom;
+    lines = (LONG)SendMessageW(gEdit, EM_GETLINECOUNT, 0, 0);
+    if (lines < 1) lines = 1;
+    li = (LONG)SendMessageW(gEdit, EM_LINEINDEX, (WPARAM)(lines - 1), 0);
+    pl.x = pl.y = 0;
+    SendMessageW(gEdit, EM_POSFROMCHAR, (WPARAM)&pl, li);
+    if (lines >= 2) {
+        li = (LONG)SendMessageW(gEdit, EM_LINEINDEX, (WPARAM)(lines - 2), 0);
+        pp.x = pp.y = 0;
+        SendMessageW(gEdit, EM_POSFROMCHAR, (WPARAM)&pp, li);
+        lh = pl.y - pp.y;
+    }
+    if (lh <= 0) lh = MulDiv(gLineH, gZoom, 100);
+    return (int)(pl.y + lh) - bottom;
+}
+
+/* 上にあと何 px あるか (先頭の行が表示範囲の上端より上に出ている量) */
+static int TextRoomAbove(void)
+{
+    RECT fr;
+    SendMessageW(gEdit, EM_GETRECT, 0, (LPARAM)&fr);
+    return (int)(fr.top - EditTopY());
+}
+
+/* px > 0 で下へ (本文を上へ送る)。表示上の px で、上下とも余地の分までに制限する */
 static void AutoScrollBy(int px)
 {
     POINT sp;
     LONG before, after;
-    int room = (px < 0) ? gHintUp : gHintDown;
+    int room, moved, i;
+    room = (px > 0) ? TextRoomBelow() : TextRoomAbove();
+    if (room <= 0) return;                    /* その方向へはもう進めない */
+    if (px > room) px = room;
+    if (-px > room) px = -room;
     before = EditTopY();
     SendMessageW(gEdit, EM_GETSCROLLPOS, 0, (LPARAM)&sp);
     sp.y += px;
     if (sp.y < 0) sp.y = 0;
     SendMessageW(gEdit, EM_SETSCROLLPOS, 0, (LPARAM)&sp);
     after = EditTopY();
-    if (after == before && room) {
+    moved = (int)(before - after);           /* 実際に動いた表示上の px (下へ = 正) */
+    if (moved == 0) {
         /* 念のため: 位置の指定が効かないとき (とても長いメモで 16 ビットを超える等) は行単位で */
         static int acc = 0;
         int lh = MulDiv(gLineH, gZoom, 100), n;
         if (lh < 1) lh = 1;
         acc += px;
         n = acc / lh;
+        if (n > room / lh) n = room / lh;     /* 余地を超えない (最後の行が下端より上に行かない) */
+        if (-n > room / lh) n = -(room / lh);
         if (n) {
             acc -= n * lh;
             SendMessageW(gEdit, EM_LINESCROLL, 0, n);
+        } else if ((px > 0 && acc >= lh) || (px < 0 && -acc >= lh)) {
+            acc = 0;
         }
+        return;
+    }
+    /* 行き過ぎの補正: EM_SETSCROLLPOS の単位が表示の px と違う (表示倍率など) と、
+       最後の行が下端より上まで来てしまうことがあるので、その分だけ戻す */
+    for (i = 0; i < 3 && px > 0; i++) {
+        int r = TextRoomBelow();
+        if (r >= 0) break;
+        SendMessageW(gEdit, EM_GETSCROLLPOS, 0, (LPARAM)&sp);
+        sp.y += MulDiv(r, px, moved);         /* r < 0: 戻す量 (スクロール位置の単位に換算) */
+        if (sp.y < 0) sp.y = 0;
+        SendMessageW(gEdit, EM_SETSCROLLPOS, 0, (LPARAM)&sp);
     }
 }
 

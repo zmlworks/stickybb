@@ -28,8 +28,8 @@
   ![pin off / on](docs/topmost-pin-off-on.png)
 - **細いタイトルバーボタン（v1.2.0）**: タイトルバーを自前で描き、最小化・最大化・閉じる を Windows 11 と同じ見た目のまま幅 32px（標準 46px）に。アクティブ = 白 / 非アクティブ = 灰色、ホバー・押下・閉じるの赤、スナップレイアウトも標準どおり。グリフは Windows の Segoe Fluent Icons（無ければ Segoe MDL2 Assets）を使用
 - **狭い幅に対応（v1.2.0）**: 最小幅を約 200 に。狭くすると色ボタンの間隔を詰め、タイトルは省略（…）→ 非表示の順で場所を譲ります
-- **スクロールの手がかり（v1.2.0）**: 本文が上（下）に続いているとき、枠の上辺（下辺）が明るい赤（v1.3.0 から #FF8C96）になります
-- **ホイールクリックの自動スクロール（v1.3.0）**: 本文をホイールでクリックすると原点のマークが出て、マウスを上下に動かすと距離に応じた速さでスクロールし続けます。クリック・キー（Esc など）で終了。押したまま動かした場合は離すと終了
+- **スクロールの手がかり（v1.2.0）**: 本文が上（下）に続いているとき、枠の上辺（下辺）が明るい赤（v1.3.1 から #B5535B）になります
+- **ホイールクリックの自動スクロール（v1.3.0）**: 本文をホイールでクリックすると原点のマークが出て、マウスを上下に動かすと距離に応じた速さでスクロールし続けます（最後の行が下端に来たところで止まります）。クリック・キー（Esc など）で終了。押したまま動かした場合は離すと終了
 - 複数起動すると、それぞれ別のメモ（`StickyBB.rtf`, `StickyBB-2.rtf`, …）として開きます。位置・タイトル・倍率・最前面はウィンドウごとに `StickyBB.ini` に保存されます
 - 貼り付けは書式なしテキスト（フォントが混ざって細く見えるのを防ぐため）
 
@@ -76,6 +76,6 @@ Features: 7 chalk ink colours, safe auto-save (every 30 min, on close, on shutdo
 per-window zoom (Ctrl+; or Ctrl+= / Ctrl+- / Ctrl+0, display-only so colours and the saved RTF are unchanged),
 a per-window "always on top" pin toggle in the title bar,
 a custom-drawn Windows 11 style title bar with narrower (32 px) caption buttons, a layout that packs the colour buttons and hides the title on narrow windows,
-a scroll hint (the top/bottom frame turns bright chalk red #FF8C96 when there is more text above/below),
+a scroll hint (the top/bottom frame turns a brighter red #B5535B when there is more text above/below),
 and middle-click autoscroll (origin marker; scroll speed follows the distance from it; any click or key ends it, or release after press-and-drag). Multiple instances keep separate notes; per-window settings live in `StickyBB.ini` next to the exe.
 Build with `./build.sh` (MinGW-w64). Licensed under the MIT License.
