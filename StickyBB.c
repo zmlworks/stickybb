@@ -22,6 +22,7 @@
 #define IDI_APP          1
 #define ID_TIMER_AUTO    2
 #define ID_TIMER_IDLE    3
+#define ID_TIMER_SAVE    5   /* 追加(v1.3.2): 入力が止まってから保存 */
 #define IDM_UNDO       401
 #define IDM_CUT        402
 #define IDM_COPY       403
@@ -31,6 +32,7 @@
 
 #define AUTO_MS      (30 * 60 * 1000)
 #define IDLE_MS      (10 * 60 * 1000)
+#define SAVE_IDLE_MS 3000   /* 追加(v1.3.2): 最後の変更から 3 秒で保存 */
 #define BORDER       5
 #define PAD          8
 #define BAR_H        28
@@ -108,6 +110,11 @@ static wchar_t gUserTitle[TITLE_MAX + 1]; /* 追加: INI の title (空なら既
 static wchar_t gIni[MAX_PATH];
 static int     gSlot = 1;
 static int     gDirty = 0;
+/* 追加(v1.3.2): メモ ファイルがあるのに開けない/読めなかったとき 1。元のファイルを
+   空や途中までの内容で上書きしないよう、このウィンドウでは保存しない。 */
+static int     gNoSave = 0;
+static DWORD   gLoadErr = 0;
+#define NOSAVE_MARK L" (保存停止)"
 static int     gInk = 0;
 static int     gReady = 0;
 static int     gReentering = 0;
@@ -173,6 +180,7 @@ static void UpdateTitle(void)
     if (!gMain) return;
     lstrcpyW(buf, gDirty ? DIRTY_MARK : L"");
     lstrcatW(buf, gUserTitle[0] ? gUserTitle : gTitle);
+    if (gNoSave) lstrcatW(buf, NOSAVE_MARK);   /* 追加(v1.3.2) */
     SetWindowTextW(gMain, buf);   /* WM_SETTEXT でキャプションを描き直す */
 }
 
@@ -354,7 +362,9 @@ static int ClaimSlot(void)
         }
         if (h) CloseHandle(h);
     }
-    return MAX_SLOT;
+    /* 修正(v1.3.2): 以前は 32 枚すべて使用中でも 32 番を返し、同じ StickyBB-32.rtf を
+       2 つのウィンドウで開いて互いに上書きしていた。0 を返して起動を断る。 */
+    return 0;
 }
 
 static void NotePath(void)
@@ -486,6 +496,8 @@ static void SaveNote(void)
     HANDLE h;
     EDITSTREAM es;
     BOOL ok;
+    if (gNoSave) return;   /* 追加(v1.3.2): 読み込みに失敗したメモは上書きしない */
+    if (gMain) KillTimer(gMain, ID_TIMER_SAVE);
     if (lstrlenW(gPath) + 5 >= MAX_PATH + 8) return;
     lstrcpyW(tmp, gPath);
     lstrcatW(tmp, L".tmp");
@@ -505,24 +517,59 @@ static void SaveNote(void)
     SetDirty(0);
 }
 
+/* 追加(v1.3.2): 変更のたびに呼ぶ。入力が SAVE_IDLE_MS 止まったら保存する */
+static void KickIdleSave(void)
+{
+    if (!gMain || gNoSave) return;
+    SetTimer(gMain, ID_TIMER_SAVE, SAVE_IDLE_MS, NULL);   /* 同じ ID なら置き換え */
+}
+
+/* 修正(v1.3.2): 以前は開けないとき (ほかのアプリが使用中・アクセス拒否など) も新しい空のメモとして
+   始めていたため、次の自動保存/閉じたときに空の内容で元のメモを上書きしてしまう恐れがあった。
+   「ファイルが無い」(ERROR_FILE_NOT_FOUND) ときだけ新しいメモとし、それ以外の失敗や読み込み途中の
+   エラーでは gNoSave を立てて保存しない (起動後に警告を出す)。
+   共有モードに FILE_SHARE_WRITE | FILE_SHARE_DELETE を加え、同期ソフトなどが開いていても読めるようにした。 */
 static void LoadNote(void)
 {
-    HANDLE h = CreateFileW(gPath, GENERIC_READ, FILE_SHARE_READ, NULL,
+    EDITSTREAM es;
+    HANDLE h = CreateFileW(gPath, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
         ApplyDefaultFormat();
+        if (e != ERROR_FILE_NOT_FOUND) {
+            gNoSave = 1;
+            gLoadErr = e ? e : ERROR_GEN_FAILURE;
+        }
         return;
     }
-    {
-        EDITSTREAM es;
-        ZeroMemory(&es, sizeof(es));
-        es.dwCookie = (DWORD_PTR)h;
-        es.pfnCallback = StreamInProc;
-        SendMessageW(gEdit, EM_STREAMIN, SF_RTF, (LPARAM)&es);
+    ZeroMemory(&es, sizeof(es));
+    es.dwCookie = (DWORD_PTR)h;
+    es.pfnCallback = StreamInProc;
+    SendMessageW(gEdit, EM_STREAMIN, SF_RTF, (LPARAM)&es);
+    if (es.dwError != 0) {
+        DWORD e = GetLastError();
+        gNoSave = 1;
+        gLoadErr = e ? e : ERROR_READ_FAULT;
     }
     CloseHandle(h);
     ApplyLayoutFormat(0);
     SetDirty(0);
+}
+
+/* 追加(v1.3.2): 読み込みに失敗したことをウィンドウの表示後に知らせる */
+static void ShowLoadError(HWND owner)
+{
+    wchar_t msg[MAX_PATH + 512];
+    if (!gNoSave) return;
+    wsprintfW(msg,
+        L"メモのファイルを読み込めませんでした (エラー %lu)。\n%s\n\n"
+        L"ほかのアプリ (同期・バックアップ・ウイルス対策など) が使用中か、アクセスが拒否された可能性があります。\n\n"
+        L"元のファイルを守るため、このウィンドウでは保存しません (タイトルに「保存停止」と表示)。\n"
+        L"いったん閉じて、しばらくしてから開き直してください。",
+        (unsigned long)gLoadErr, gPath);
+    MessageBoxW(owner, msg, L"StickyBB", MB_OK | MB_ICONWARNING);
 }
 
 /* 追加: 文書の先頭文字が '#' なら、その1行目をタイトルとして取り出して削除する。
@@ -556,7 +603,7 @@ static int TakeTitleLine(void)
     CHARRANGE save, del;
     wchar_t sec[16];
 
-    if (!gEdit) return 0;
+    if (!gEdit || gNoSave) return 0;   /* 追加(v1.3.2): 保存しないメモでは INI のタイトルも変えない */
     tr.chrg.cpMin = 0; tr.chrg.cpMax = 1; line[0] = 0;
     tr.lpstrText = line;
     SendMessageW(gEdit, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
@@ -622,7 +669,7 @@ static void ColorCaption(HWND hwnd)
     typedef HRESULT (WINAPI *FN)(HWND, DWORD, LPCVOID, DWORD);
     HMODULE m = LoadLibraryW(L"dwmapi.dll");
     if (!m) return;
-    FN fn = (FN)GetProcAddress(m, "DwmSetWindowAttribute");
+    FN fn = (FN)(void *)GetProcAddress(m, "DwmSetWindowAttribute");
     if (fn) {
         COLORREF cap = COL_TITLE, txt = COL_FG, brd = COL_TITLE;
         BOOL dark = TRUE;
@@ -2027,6 +2074,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (LOWORD(wp) == ID_SAVE) {
             /* 追加: 手動保存時にも '#タイトル' 行を処理 (自動保存では入力中の文字を
                消してしまうので行わない) */
+            if (gNoSave) {   /* 追加(v1.3.2) */
+                ShowLoadError(hwnd);
+                return 0;
+            }
             TakeTitleLine();
             SaveNote();
         }
@@ -2054,7 +2105,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             {
                 CHARRANGE cr;
                 SendMessageW(gEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
-                if (cr.cpMin != cr.cpMax) SetDirty(1);
+                if (cr.cpMin != cr.cpMax) { SetDirty(1); KickIdleSave(); }
             }
             gInk = idx;
             SetTypingColor(kInk[idx]);
@@ -2065,6 +2116,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             TouchIdle();
         } else if (LOWORD(wp) == ID_EDIT && HIWORD(wp) == EN_CHANGE) {
             SetDirty(1);
+            KickIdleSave();   /* 追加(v1.3.2) */
             HideEditBar();
             TouchIdle();
             PostHint();
@@ -2086,6 +2138,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == ID_TIMER_AUTO && gDirty)
             SaveNote();
+        else if (wp == ID_TIMER_SAVE) {   /* 追加(v1.3.2): 入力が止まってから保存 ('#タイトル' 行は処理しない) */
+            KillTimer(hwnd, ID_TIMER_SAVE);
+            if (gDirty) SaveNote();
+        }
         else if (wp == ID_TIMER_IDLE)
             ResetInkToDefault();
         else if (wp == ID_TIMER_ASCROLL)
@@ -2112,11 +2168,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         TakeTitleLine();
         if (gDirty) SaveNote();
         return TRUE;
+    case WM_POWERBROADCAST:
+        /* 追加(v1.3.2): スリープ/休止状態に入る前に保存 (そのまま電源が切れても残るように)。
+           入力中の '#タイトル' 行は消さない (自動保存と同じ) */
+        if (wp == PBT_APMSUSPEND) {
+            SavePlacement(hwnd);
+            if (gDirty) SaveNote();
+        }
+        break;
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE) AutoScrollStop();   /* 追加(v1.3) */
         ColorCaption(hwnd);
         break;
     case WM_CLOSE:
+        /* 追加(v1.3.2): 保存しないメモに書き足した内容は閉じると消えるので確かめる */
+        if (gNoSave && gDirty &&
+            MessageBoxW(hwnd,
+                L"このメモは読み込みに失敗したため保存されません。\n"
+                L"このウィンドウで入力した内容は失われます。閉じますか?\n\n"
+                L"(残したい内容は、閉じる前にコピーしてほかのメモに貼り付けてください)",
+                L"StickyBB", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+            return 0;
         SavePlacement(hwnd);
         TakeTitleLine();   /* 追加: '#タイトル' 行 → INI に保存し本文から削除 */
         if (gDirty) SaveNote();
@@ -2146,6 +2218,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         return 0;
 
     gSlot = ClaimSlot();
+    if (gSlot == 0) {   /* 追加(v1.3.2): 33 枚目は開かない */
+        MessageBoxW(NULL, L"StickyBB は同時に 32 枚まで開けます。\n"
+                          L"ほかのメモを閉じてから開いてください。",
+                    L"StickyBB", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
     IniPath();
     LoadUserTitle();
     {   /* 追加(v1.1): ウィンドウごとの表示倍率と最前面 */
@@ -2190,6 +2268,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     ShowWindow(gMain, SW_SHOW);
     if (gTopmost) SetTopmost(1, 0);   /* 追加(v1.1) */
     PostHint();
+    if (gNoSave) {   /* 追加(v1.3.2): 読み込み失敗の警告 (ウィンドウを出してから) */
+        UpdateTitle();
+        ShowLoadError(gMain);
+    }
 
     ACCEL acc = { FVIRTKEY | FCONTROL, 'S', ID_SAVE };
     HACCEL hAcc = CreateAcceleratorTableW(&acc, 1);

@@ -17,7 +17,8 @@
   - 並び: `#C6CFC6`, `#C05E40`, `#B56B85`, `#AEB872`, `#41A18B`, `#6E9EB2`, `#8B918B`
   - 範囲を選択して色ボタンを押すと、その部分の色を変更
   - 10 分操作しないとインク色は先頭の色に戻ります
-- 自動保存: 30 分ごと・ウィンドウを閉じたとき・シャットダウン / サインアウト時。一時ファイルに書いてから置き換える安全な保存
+- 自動保存: 入力が止まってから 3 秒後（v1.3.2）・30 分ごと・ウィンドウを閉じたとき・スリープ前（v1.3.2）・シャットダウン / サインアウト時。一時ファイルに書いてから置き換える安全な保存
+  - メモのファイルがあるのに読み込めなかったとき（ほかのアプリが使用中など）は警告を出し、そのウィンドウでは保存しません（タイトルに「(保存停止)」。元のメモを空の内容で上書きしないため。v1.3.2）
 - 未保存マーク: 変更があるとタイトルの先頭に青い「* 」（#00A2E8。v1.2.1 で「● 」から変更）
 - タイトル設定: 本文の 1 文字目が `#` の行（例 `#買い物メモ`）は、閉じる・Ctrl+S・シャットダウン時にウィンドウタイトルになります（本文からは削除、INI に保存）
   - タイトルには制御文字以外のすべての文字（`*` `?` `:` `"` `/` `\` `<` `>` `|` を含む）が使えます。前後の空白は除き、最大 64 文字です（v1.2.1）
@@ -30,7 +31,7 @@
 - **狭い幅に対応（v1.2.0）**: 最小幅を約 200 に。狭くすると色ボタンの間隔を詰め、タイトルは省略（…）→ 非表示の順で場所を譲ります
 - **スクロールの手がかり（v1.2.0）**: 本文が上（下）に続いているとき、枠の上辺（下辺）が明るい赤（v1.3.1 から #B5535B）になります
 - **ホイールクリックの自動スクロール（v1.3.0）**: 本文をホイールでクリックすると原点のマークが出て、マウスを上下に動かすと距離に応じた速さでスクロールし続けます（最後の行が下端に来たところで止まります）。クリック・キー（Esc など）で終了。押したまま動かした場合は離すと終了
-- 複数起動すると、それぞれ別のメモ（`StickyBB.rtf`, `StickyBB-2.rtf`, …）として開きます。位置・タイトル・倍率・最前面はウィンドウごとに `StickyBB.ini` に保存されます
+- 複数起動すると、それぞれ別のメモ（`StickyBB.rtf`, `StickyBB-2.rtf`, …）として開きます（同時に 32 枚まで）。位置・タイトル・倍率・最前面はウィンドウごとに `StickyBB.ini` に保存されます
 - 貼り付けは書式なしテキスト（フォントが混ざって細く見えるのを防ぐため）
 
 ## ショートカット
@@ -72,10 +73,10 @@ Visual Studio の場合は `StickyBB.c` と `StickyBB.rc` をプロジェクト�
 ## English (short)
 
 StickyBB is a small chalkboard-style sticky-note app for Windows (single exe, plain C/Win32, RichEdit).
-Features: 7 chalk ink colours, safe auto-save (every 30 min, on close, on shutdown/sign-out), a blue `* ` unsaved mark, `#title` first line sets the window title (any printable characters, only that first line is removed),
+Features: 7 chalk ink colours, safe auto-save (3 s after typing stops, every 30 min, on close, before sleep, on shutdown/sign-out; a note whose file exists but cannot be read is shown with a warning and never saved, so it cannot overwrite the real file), a blue `* ` unsaved mark, `#title` first line sets the window title (any printable characters, only that first line is removed),
 per-window zoom (Ctrl+; or Ctrl+= / Ctrl+- / Ctrl+0, display-only so colours and the saved RTF are unchanged),
 a per-window "always on top" pin toggle in the title bar,
 a custom-drawn Windows 11 style title bar with narrower (32 px) caption buttons, a layout that packs the colour buttons and hides the title on narrow windows,
 a scroll hint (the top/bottom frame turns a brighter red #B5535B when there is more text above/below),
-and middle-click autoscroll (origin marker; scroll speed follows the distance from it; any click or key ends it, or release after press-and-drag). Multiple instances keep separate notes; per-window settings live in `StickyBB.ini` next to the exe.
+and middle-click autoscroll (origin marker; scroll speed follows the distance from it; any click or key ends it, or release after press-and-drag). Multiple instances (up to 32) keep separate notes; per-window settings live in `StickyBB.ini` next to the exe.
 Build with `./build.sh` (MinGW-w64). Licensed under the MIT License.
