@@ -8,6 +8,7 @@
 #include <richedit.h>
 #include <commctrl.h>
 #include <wchar.h>
+#include <stdlib.h>
 #ifdef TEST_HARNESS
 #include <stdio.h>
 #endif
@@ -67,9 +68,11 @@
 #define COL_CLOSE_HOT   RGB(0xC4, 0x2B, 0x1C)   /* 閉じる ホバー (Win11 と同じ) */
 #define CLOSE_PRESS_ALPHA 230 /* 閉じる 押下: #C42B1C を 90% */
 #define PRESS_GLYPH_ALPHA 200 /* 押下中のグリフは少し暗く */
-/* 追加(v1.2): スクロールの手がかり (枠の上下を少し明るく) */
+/* 追加(v1.2): スクロールの手がかり (枠の上下を少し明るく)
+   変更(v1.3): 目立つように #6A1A20 → 明るいチョークのような赤 #FF8C96。幅 (3px) と枠 (BORDER) は同じ */
 #define HINT_PX         3
-#define COL_HINT        RGB(0x6A, 0x1A, 0x20)
+#define COL_HINT        RGB(0xFF, 0x8C, 0x96)
+static const int kHintAlpha[HINT_PX] = { 255, 200, 130 };   /* 緑の面に接する行から外へ (v1.2: 255,170,85) */
 #define WM_APP_HINT     (WM_APP + 3)
 
 enum { CB_NONE = 0, CB_PIN, CB_MIN, CB_MAX, CB_CLOSE };
@@ -699,8 +702,269 @@ static void ShowEditMenu(HWND edit, int sx, int sy)
     DestroyMenu(m);
 }
 
+/* ---- 追加(v1.3): 中ボタン (ホイールクリック) の自動スクロール ----
+   ブラウザーや Windows のアプリと同じ操作:
+   - 本文を中ボタンでクリック → その位置に原点マーカー (丸と上下の三角) を出し、
+     マウスを原点より上 (下) へ動かすと、離れた距離に応じた速さで上 (下) へ連続スクロール。
+     どのボタンのクリック・どのキー (Esc など)・ホイール・ほかのウィンドウへの切り替えで終了。
+   - 中ボタンを押したまま原点から動かした場合は、ボタンを離すと終了 (押している間だけスクロール)。
+   本文は折り返し表示で横スクロールが無いので、縦方向だけ。スクロール位置を動かすだけなので、
+   文字・色・選択範囲・カーソル位置・保存内容 (変更扱い) には一切手を付けない。
+   DPI 非対応のまま (大きさは固定 px)。 */
+#define ID_TIMER_ASCROLL 4
+#define AS_TICK_MS      15     /* 約 66 回/秒 */
+#define AS_DEAD         10     /* 原点からこの px 以内は止まっている */
+#define AS_MARK         28     /* 原点マーカーの大きさ (px) */
+#define AS_MAX_SPEED    6000.0 /* px/秒 */
+#define AS_KEY          RGB(0xFF, 0x00, 0xFF)   /* マーカーの透明色 */
+#define COL_AS_DIM      RGB(0x4A, 0x5C, 0x56)   /* その方向へはスクロールできない三角 */
+
+static void UpdateScrollHint(void);
+static int    gAS = 0;          /* 1: 自動スクロール中 */
+static int    gASHeld = 0;      /* 1: 開始した中ボタンをまだ押している */
+static int    gASDragged = 0;   /* 1: 押したまま原点から離れた → 離したら終了 */
+static POINT  gASOrg;           /* 原点 (スクリーン座標) */
+static double gASAcc = 0;       /* スクロール量の端数 (px) */
+static LARGE_INTEGER gASLast, gASFreq;
+static HWND   gASMark = NULL;   /* 原点マーカー (透明色付きの小さなポップアップ) */
+static int    gASMarkUp = -1, gASMarkDown = -1;
+static UINT   gASEatUp = 0;     /* 終了に使ったクリックの「離した」メッセージを捨てる */
+
+static LRESULT CALLBACK ASMarkProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hw, &ps);
+        RECT rc;
+        HBRUSH key = CreateSolidBrush(AS_KEY), bg = CreateSolidBrush(COL_BG);
+        HBRUSH up = CreateSolidBrush(gASMarkUp ? COL_FG : COL_AS_DIM);
+        HBRUSH dn = CreateSolidBrush(gASMarkDown ? COL_FG : COL_AS_DIM);
+        HBRUSH dot = CreateSolidBrush(COL_FG);
+        HPEN pen = CreatePen(PS_SOLID, 2, COL_FG);
+        HPEN nop = (HPEN)GetStockObject(NULL_PEN);
+        HGDIOBJ op, ob;
+        int c = AS_MARK / 2;
+        POINT tu[3], td[3];
+        GetClientRect(hw, &rc);
+        FillRect(dc, &rc, key);
+        op = SelectObject(dc, pen);
+        ob = SelectObject(dc, bg);
+        Ellipse(dc, 1, 1, AS_MARK - 1, AS_MARK - 1);          /* 黒板色の丸 + チョーク色の縁 */
+        SelectObject(dc, nop);
+        tu[0].x = c;     tu[0].y = 5;
+        tu[1].x = c - 5; tu[1].y = 11;
+        tu[2].x = c + 5; tu[2].y = 11;
+        td[0].x = c;     td[0].y = AS_MARK - 5;
+        td[1].x = c - 5; td[1].y = AS_MARK - 11;
+        td[2].x = c + 5; td[2].y = AS_MARK - 11;
+        SelectObject(dc, up);  Polygon(dc, tu, 3);
+        SelectObject(dc, dn);  Polygon(dc, td, 3);
+        SelectObject(dc, dot); Ellipse(dc, c - 2, c - 2, c + 3, c + 3);
+        SelectObject(dc, op);
+        SelectObject(dc, ob);
+        DeleteObject(key); DeleteObject(bg); DeleteObject(up); DeleteObject(dn);
+        DeleteObject(dot); DeleteObject(pen);
+        EndPaint(hw, &ps);
+        return 0;
+    }
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    return DefWindowProcW(hw, msg, wp, lp);
+}
+
+/* 三角の明るさ = その方向にまだスクロールできるか (枠の手がかりと同じ判定) */
+static void ASMarkSync(void)
+{
+    if (!gASMark) return;
+    if (gASMarkUp != gHintUp || gASMarkDown != gHintDown) {
+        gASMarkUp = gHintUp;
+        gASMarkDown = gHintDown;
+        InvalidateRect(gASMark, NULL, FALSE);
+    }
+}
+
+static void ASSetCursor(void)
+{
+    SetCursor(LoadCursor(NULL, IDC_SIZENS));
+}
+
+static void AutoScrollStop(void)
+{
+    POINT pt;
+    HWND w;
+    if (!gAS) return;
+    gAS = 0;
+    gASHeld = 0;
+    gASAcc = 0;
+    if (gMain) KillTimer(gMain, ID_TIMER_ASCROLL);
+    if (gASMark) ShowWindow(gASMark, SW_HIDE);
+    if (GetCapture() == gEdit) ReleaseCapture();
+    PostHint();
+    /* マウスの形を、いまマウスの下にあるもの本来の形に戻す */
+    GetCursorPos(&pt);
+    w = WindowFromPoint(pt);
+    if (w && GetWindowThreadProcessId(w, NULL) == GetCurrentThreadId()) {
+        LRESULT ht = SendMessageW(w, WM_NCHITTEST, 0, MAKELPARAM(pt.x, pt.y));
+        SendMessageW(w, WM_SETCURSOR, (WPARAM)w, MAKELPARAM((WORD)ht, WM_MOUSEMOVE));
+    }
+}
+
+/* 戻り値 1: 開始した */
+static int AutoScrollStart(HWND edit, LPARAM lp)
+{
+    POINT s;
+    if (!gMain || !edit) return 0;
+    UpdateScrollHint();
+    if (!gHintUp && !gHintDown) return 0;   /* スクロールする余地が無い */
+    s.x = (short)LOWORD(lp);
+    s.y = (short)HIWORD(lp);
+    ClientToScreen(edit, &s);
+    gASOrg = s;
+    gAS = 1;
+    gASHeld = 1;
+    gASDragged = 0;
+    gASAcc = 0;
+    gASEatUp = 0;
+    QueryPerformanceFrequency(&gASFreq);
+    QueryPerformanceCounter(&gASLast);
+    if (!gASMark) {
+        WNDCLASSW mc = {0};
+        mc.lpfnWndProc   = ASMarkProc;
+        mc.hInstance     = GetModuleHandleW(NULL);
+        mc.hCursor       = LoadCursor(NULL, IDC_SIZENS);
+        mc.lpszClassName = L"StickyBBAutoScrollMark";
+        RegisterClassW(&mc);
+        gASMark = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW |
+                                  WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                                  L"StickyBBAutoScrollMark", L"", WS_POPUP,
+                                  0, 0, AS_MARK, AS_MARK, gMain, NULL, GetModuleHandleW(NULL), NULL);
+        if (gASMark) SetLayeredWindowAttributes(gASMark, AS_KEY, 0, LWA_COLORKEY);
+    }
+    if (gASMark) {
+        gASMarkUp = gHintUp;
+        gASMarkDown = gHintDown;
+        InvalidateRect(gASMark, NULL, FALSE);
+        SetWindowPos(gASMark, HWND_TOPMOST, s.x - AS_MARK / 2, s.y - AS_MARK / 2, AS_MARK, AS_MARK,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    SetCapture(edit);
+    ASSetCursor();
+    SetTimer(gMain, ID_TIMER_ASCROLL, AS_TICK_MS, NULL);
+    return 1;
+}
+
+/* 表示上の縦位置 (先頭の文字の y)。スクロールで動いたかの確認用 */
+static LONG EditTopY(void)
+{
+    POINTL p;
+    p.x = p.y = 0;
+    SendMessageW(gEdit, EM_POSFROMCHAR, (WPARAM)&p, 0);
+    return p.y;
+}
+
+static void AutoScrollBy(int px)
+{
+    POINT sp;
+    LONG before, after;
+    int room = (px < 0) ? gHintUp : gHintDown;
+    before = EditTopY();
+    SendMessageW(gEdit, EM_GETSCROLLPOS, 0, (LPARAM)&sp);
+    sp.y += px;
+    if (sp.y < 0) sp.y = 0;
+    SendMessageW(gEdit, EM_SETSCROLLPOS, 0, (LPARAM)&sp);
+    after = EditTopY();
+    if (after == before && room) {
+        /* 念のため: 位置の指定が効かないとき (とても長いメモで 16 ビットを超える等) は行単位で */
+        static int acc = 0;
+        int lh = MulDiv(gLineH, gZoom, 100), n;
+        if (lh < 1) lh = 1;
+        acc += px;
+        n = acc / lh;
+        if (n) {
+            acc -= n * lh;
+            SendMessageW(gEdit, EM_LINESCROLL, 0, n);
+        }
+    }
+}
+
+static void AutoScrollTick(void)
+{
+    POINT p;
+    LARGE_INTEGER now;
+    double dt, d, v;
+    int dy, step;
+    if (!gAS) return;
+    if (gASHeld && !(GetAsyncKeyState(VK_MBUTTON) & 0x8000)) {
+        /* 離したメッセージを取りこぼしたとき (ほかのウィンドウの上で離した等) */
+        gASHeld = 0;
+        if (gASDragged) { AutoScrollStop(); return; }
+    }
+    GetCursorPos(&p);
+    QueryPerformanceCounter(&now);
+    dt = (double)(now.QuadPart - gASLast.QuadPart) / (double)gASFreq.QuadPart;
+    gASLast = now;
+    if (dt < 0) dt = 0;
+    if (dt > 0.1) dt = 0.1;
+    dy = p.y - gASOrg.y;
+    if (gASHeld && (abs(dy) > AS_DEAD || abs(p.x - gASOrg.x) > AS_DEAD)) gASDragged = 1;
+    d = (double)(abs(dy) - AS_DEAD);
+    if (d <= 0) { gASAcc = 0; return; }
+    v = d * 8.0 + d * d * 0.08;          /* 距離 20px → 約 190px/秒, 50px → 約 600, 100px → 約 1600 */
+    if (v > AS_MAX_SPEED) v = AS_MAX_SPEED;
+    gASAcc += (dy < 0 ? -v : v) * dt;
+    step = (int)gASAcc;                   /* 端数は次回へ持ち越す */
+    if (!step) return;
+    gASAcc -= step;
+    AutoScrollBy(step);
+    UpdateScrollHint();
+    ASMarkSync();
+}
+
 static LRESULT CALLBACK EditProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* 追加(v1.3): 中ボタンの自動スクロール中は、マウスとフォーカスのメッセージをここで処理する */
+    if (gAS) {
+        switch (msg) {
+        case WM_MOUSEMOVE:
+            ASSetCursor();
+            return 0;
+        case WM_SETCURSOR:
+            ASSetCursor();
+            return TRUE;
+        case WM_MBUTTONUP:
+            if (gASHeld) {
+                gASHeld = 0;
+                if (gASDragged) AutoScrollStop();   /* 押したまま動かした → 離して終了 */
+            }
+            return 0;
+        case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDOWN: case WM_XBUTTONDBLCLK:
+            /* どのボタンでも終了。そのクリックは本文に渡さない (カーソルが動かないように) */
+            gASEatUp = (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK) ? WM_LBUTTONUP :
+                       (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK) ? WM_RBUTTONUP :
+                       (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONDBLCLK) ? WM_MBUTTONUP : WM_XBUTTONUP;
+            AutoScrollStop();
+            return 0;
+        case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_XBUTTONUP:
+            return 0;
+        case WM_MOUSEWHEEL:
+        case WM_KILLFOCUS:
+        case WM_CAPTURECHANGED:
+            AutoScrollStop();
+            break;          /* それぞれ通常の処理も行う */
+        }
+    }
+    if (gASEatUp && msg == gASEatUp) {
+        gASEatUp = 0;
+        return 0;
+    }
+    if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONDBLCLK) {
+        gASEatUp = 0;
+        AutoScrollStart(hw, lp);
+        return 0;           /* スクロールの余地が無いときは何もしない */
+    }
     /* 修正(細字の原因の一つ): 貼り付けを書式なしテキストに限定する。
        旧版は Web/Word 等からの RTF/HTML 貼り付けで、元のフォント(游ゴシック Light 等)・
        太さ・サイズがそのまま入り、その部分だけ細く/違って見えていた。 */
@@ -1688,7 +1952,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         FillRect(dc, &band, gBg);
         /* 追加(v1.2): スクロールの手がかり。緑の面に接する側ほど明るいグラデーション (HINT_PX 行) */
         for (i = 0; i < HINT_PX && (gHintUp || gHintDown); i++) {
-            HBRUSH hb = CreateSolidBrush(Blend(COL_HINT, COL_TITLE, 255 * (HINT_PX - i) / HINT_PX));
+            HBRUSH hb = CreateSolidBrush(Blend(COL_HINT, COL_TITLE, kHintAlpha[i]));
             if (gHintUp) {
                 SetRect(&band, BORDER, gCapH + BORDER - 1 - i, rc.right - BORDER, gCapH + BORDER - i);
                 FillRect(dc, &band, hb);
@@ -1767,6 +2031,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SaveNote();
         else if (wp == ID_TIMER_IDLE)
             ResetInkToDefault();
+        else if (wp == ID_TIMER_ASCROLL)
+            AutoScrollTick();   /* 追加(v1.3) */
         return 0;
     case WM_GETMINMAXINFO: {
         MINMAXINFO *m = (MINMAXINFO *)lp;
@@ -1790,6 +2056,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (gDirty) SaveNote();
         return TRUE;
     case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) AutoScrollStop();   /* 追加(v1.3) */
         ColorCaption(hwnd);
         break;
     case WM_CLOSE:
@@ -1799,6 +2066,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        AutoScrollStop();   /* 追加(v1.3) */
+        if (gASMark) { DestroyWindow(gASMark); gASMark = NULL; }
         if (gFont) DeleteObject(gFont);
         if (gBg) DeleteObject(gBg);
         if (gBorder) DeleteObject(gBorder);
@@ -1873,7 +2142,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         /* 修正: 通常ウィンドウに IsDialogMessage を使うと Tab 等のキーが横取りされるため削除 */
         /* 追加(v1.1): 拡大/縮小キー。RichEdit に届く前に処理する
            (RichEdit 自身の Ctrl+= 下付き文字などに取られないように) */
-        int zc = ZoomKeyCommand(&msg);
+        int zc;
+        /* 追加(v1.3): 自動スクロール中は、どのキーでも (Esc を含む) 終了するだけで入力はしない */
+        if (gAS && (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN)) {
+            AutoScrollStop();
+            continue;
+        }
+        zc = ZoomKeyCommand(&msg);
         if (zc) {
             SendMessageW(gMain, WM_COMMAND, MAKEWPARAM(zc, 0), 0);
             continue;
