@@ -5,6 +5,7 @@
 #define _UNICODE
 #define _RICHEDIT_VER 0x0800
 #include <windows.h>
+#include <imm.h>
 #include <richedit.h>
 #include <commctrl.h>
 #include <wchar.h>
@@ -32,7 +33,7 @@
 
 #define AUTO_MS      (30 * 60 * 1000)
 #define IDLE_MS      (10 * 60 * 1000)
-#define SAVE_IDLE_MS 3000   /* 追加(v1.3.2): 最後の変更から 3 秒で保存 */
+#define SAVE_IDLE_MS 30000  /* 修正(v1.3.3): 最後の変更から 30 秒で保存 (旧 3 秒は日本語変換中に確定されてしまうため) */
 #define BORDER       5
 #define PAD          8
 #define BAR_H        28
@@ -1863,7 +1864,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 #ifdef TEST_HARNESS
         SetTimer(hwnd, 99, 1500, NULL);
 #endif
-        SetTimer(hwnd, ID_TIMER_AUTO, AUTO_MS, NULL);
+        /* 削除(v1.3.3): 30 分ごとの自動保存は、入力停止後の保存・閉じる時/スリープ前の保存と重複するため廃止 */
         gReady = 1;
         ReapplyInkIfCaret();
         return 0;
@@ -2140,7 +2141,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SaveNote();
         else if (wp == ID_TIMER_SAVE) {   /* 追加(v1.3.2): 入力が止まってから保存 ('#タイトル' 行は処理しない) */
             KillTimer(hwnd, ID_TIMER_SAVE);
-            if (gDirty) SaveNote();
+            if (gDirty) {
+                /* 追加(v1.3.3): 日本語変換中 (未確定文字あり) なら保存せず 5 秒後に再試行 */
+                HIMC imc = ImmGetContext(gEdit);
+                LONG comp = imc ? ImmGetCompositionStringW(imc, GCS_COMPSTR, NULL, 0) : 0;
+                if (imc) ImmReleaseContext(gEdit, imc);
+                if (comp > 0) SetTimer(hwnd, ID_TIMER_SAVE, 5000, NULL);
+                else SaveNote();
+            }
         }
         else if (wp == ID_TIMER_IDLE)
             ResetInkToDefault();
